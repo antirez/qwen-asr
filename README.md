@@ -106,11 +106,11 @@ Streaming mode processes audio in **2-second chunks** with rollback text conditi
 This keeps encoder recomputation under control. For long streams, a **sliding window** automatically bounds both encoder and decoder context so that memory and compute stay flat indefinitely:
 
 - **Encoder window eviction**: only the most recent 4 encoder attention windows (~32 s of audio context) are kept; older windows are freed.
-- **Decoder prefix capping**: only the most recent ~150 tokens of previously decoded text are fed as decoder prefix context. The full token history is kept internally for correct text-level monotonic commit, but only the capped tail is embedded into the decoder input.
+- **Decoder prefix capping**: only the most recent ~150 tokens of previously decoded text are fed as decoder prefix context. Internal token history is still tracked for streaming commit/dedup decisions, while only the capped tail is embedded into the decoder input.
 
 These limits activate automatically when the stream is long enough to exceed them. For short files or live sessions under ~40 s, they have no effect.
 
-`--stream --silent` is a special non-interactive path: it skips chunk-by-chunk emission and runs a direct final refinement pass, so its timing is not representative of interactive streaming cost.
+`--stream --silent` has a special non-interactive behavior for file input: it skips chunk-by-chunk streaming and runs one direct final refinement pass. (For live stdin streaming, chunked mode is still used.)
 
 Default stream settings:
 - `chunk_size`: 2s
@@ -410,9 +410,9 @@ Benchmarks were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (sin
 
 Outputs were exact matches between cache ON/OFF in this benchmark.
 
-### Streaming Non-Interactive Path (`--stream --silent`, 45s clip)
+### Streaming Non-Interactive Path (`--stream --silent`, file input)
 
-`--stream --silent` skips interactive chunk emission and runs a direct final refinement pass, so it is not directly comparable with interactive streaming throughput.
+For file input, `--stream --silent` does not run interactive chunk commits: it executes one direct final refinement pass and prints only the final transcript. This is useful for quiet batch runs, but its timing is not directly comparable to interactive `--stream`.
 
 ### Long-file Example (`/tmp/nirvana.wav`, 135s, 0.6B)
 

@@ -1073,12 +1073,120 @@ static int stream_encode_span(qwen_ctx_t *ctx, const float *samples, int n_sampl
     return 0;
 }
 
+/* Detect repeated token blocks at the sequence tail.
+ * Returns max repetitions found (>=1), and stores period in out_period. */
+static int stream_tail_repeat_blocks(const int *tokens, int n_tokens, int max_period,
+                                     int *out_period) {
+    if (out_period) *out_period = 0;
+    if (!tokens || n_tokens < 2) return 1;
+
+    int best_reps = 1;
+    int best_period = 0;
+    int period_cap = n_tokens / 2;
+    if (max_period > 0 && period_cap > max_period) period_cap = max_period;
+
+    for (int p = 1; p <= period_cap; p++) {
+        int reps = 1;
+        while ((reps + 1) * p <= n_tokens) {
+            const int *a = tokens + n_tokens - (reps + 1) * p;
+            const int *b = tokens + n_tokens - reps * p;
+            if (memcmp(a, b, (size_t)p * sizeof(int)) != 0) break;
+            reps++;
+        }
+        if (reps > best_reps) {
+            best_reps = reps;
+            best_period = p;
+        }
+    }
+
+    if (out_period) *out_period = best_period;
+    return best_reps;
+}
+
 typedef struct {
     int64_t start_sample;
     int n_samples;
     int seq_len;
     float *enc_output; /* [seq_len, dec_hidden] */
 } stream_enc_window_t;
+
+static void stream_clear_enc_cache(stream_enc_window_t *enc_cache,
+                                   int *n_enc_cache,
+                                   int *enc_cache_start,
+                                   int *enc_cached_seq_total,
+                                   int64_t *next_window_start,
+                                   int64_t new_start_sample) {
+    if (!enc_cache || !n_enc_cache || !enc_cache_start ||
+        !enc_cached_seq_total || !next_window_start) {
+        return;
+    }
+    for (int i = *enc_cache_start; i < *n_enc_cache; i++) {
+        free(enc_cache[i].enc_output);
+        enc_cache[i].enc_output = NULL;
+    }
+    *n_enc_cache = 0;
+    *enc_cache_start = 0;
+    *enc_cached_seq_total = 0;
+    *next_window_start = new_start_sample;
+}
+
+/* Re-anchor stream text state to a short committed tail so decoding can
+ * continue after a hard reset without replaying the full text history. */
+static int stream_reanchor_text_state(qwen_ctx_t *ctx,
+                                      const int *emitted_text_tokens,
+                                      int n_emitted_text_tokens,
+                                      int carry_text_tokens,
+                                      int **raw_tokens,
+                                      int *raw_tokens_cap,
+                                      int *n_raw_tokens,
+                                      int **stable_text_tokens,
+                                      int *stable_text_cap,
+                                      int *n_stable_text_tokens) {
+    if (!ctx || !raw_tokens || !raw_tokens_cap || !n_raw_tokens ||
+        !stable_text_tokens || !stable_text_cap || !n_stable_text_tokens) {
+        return -1;
+    }
+
+    int carry = n_emitted_text_tokens;
+    if (carry_text_tokens > 0 && carry > carry_text_tokens) carry = carry_text_tokens;
+    if (carry < 0) carry = 0;
+
+    int raw_lead = (ctx->n_force_prompt_tokens <= 0) ? 1 : 0; /* add <asr_text> marker */
+    int raw_need = raw_lead + carry;
+
+    if (raw_need > *raw_tokens_cap) {
+        int new_cap = *raw_tokens_cap > 0 ? *raw_tokens_cap : 64;
+        while (raw_need > new_cap) new_cap *= 2;
+        int *tmp_raw = (int *)realloc(*raw_tokens, (size_t)new_cap * sizeof(int));
+        if (!tmp_raw) return -1;
+        *raw_tokens = tmp_raw;
+        *raw_tokens_cap = new_cap;
+    }
+    if (carry > *stable_text_cap) {
+        int new_cap = *stable_text_cap > 0 ? *stable_text_cap : 64;
+        while (carry > new_cap) new_cap *= 2;
+        int *tmp_stable = (int *)realloc(*stable_text_tokens, (size_t)new_cap * sizeof(int));
+        if (!tmp_stable) return -1;
+        *stable_text_tokens = tmp_stable;
+        *stable_text_cap = new_cap;
+    }
+
+    int tail_off = n_emitted_text_tokens - carry;
+    if (tail_off < 0) tail_off = 0;
+    if (raw_lead) (*raw_tokens)[0] = QWEN_TOKEN_ASR_TEXT;
+    if (carry > 0 && emitted_text_tokens) {
+        memcpy((*raw_tokens) + raw_lead,
+               emitted_text_tokens + tail_off,
+               (size_t)carry * sizeof(int));
+        memcpy(*stable_text_tokens,
+               emitted_text_tokens + tail_off,
+               (size_t)carry * sizeof(int));
+    }
+
+    *n_raw_tokens = raw_need;
+    *n_stable_text_tokens = carry;
+    return 0;
+}
 
 /* ========================================================================
  * Streaming Transcription (chunked rollback + encoder window cache)
@@ -1089,7 +1197,7 @@ typedef struct {
  *    - first N chunks: no text prefix,
  *    - later chunks: previous decoded tokens minus last K unfixed tokens.
  * 3. Decode only up to a bounded number of new tokens each step.
- * 4. Emit only stable text (monotonic committed frontier).
+ * 4. Emit token deltas from the stable frontier.
  *
  * Encoder-side optimization:
  * - The encoder uses local attention windows, so completed windows are
@@ -1201,6 +1309,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
      * grows unbounded (negligible memory) for correct text matching. */
     #define QWEN_STREAM_MAX_ENC_WINDOWS  4
     #define QWEN_STREAM_MAX_PREFIX_TOKENS 150
+    #define QWEN_STREAM_MAX_REPEAT_TOKEN_RUN 12
+    #define QWEN_STREAM_OVERLAP_MAX_TOKENS 48
+    #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
+    #define QWEN_STREAM_DEGEN_MAX_PERIOD 6
+    #define QWEN_STREAM_DEGEN_MIN_REPEATS 4
+    #define QWEN_STREAM_STALE_CHUNKS 4
+    #define QWEN_STREAM_RESET_INTERVAL_CHUNKS 45
+    #define QWEN_STREAM_RESET_CARRY_TOKENS 24
 
     if (qwen_verbose >= 2) {
         if (live)
@@ -1269,14 +1385,18 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int *stable_text_tokens = (int *)malloc(8192 * sizeof(int));
     int n_stable_text_tokens = 0;
     int stable_text_cap = 8192;
-
+    int *emitted_text_tokens = (int *)malloc(8192 * sizeof(int));
+    int n_emitted_text_tokens = 0;
+    int emitted_text_cap = 8192;
+    int stagnant_chunks = 0;
     /* Result text accumulator */
     size_t result_cap = 4096;
     size_t result_len = 0;
     char *result = (char *)malloc(result_cap);
-    if (!raw_tokens || !stable_text_tokens || !result) {
+    if (!raw_tokens || !stable_text_tokens || !emitted_text_tokens || !result) {
         free(raw_tokens);
         free(stable_text_tokens);
+        free(emitted_text_tokens);
         free(result);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
@@ -1289,6 +1409,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     if (!tmp_embed) {
         free(raw_tokens);
         free(stable_text_tokens);
+        free(emitted_text_tokens);
         free(result);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
@@ -1726,6 +1847,42 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* Update raw token history = full prefix + newly generated continuation.
          * Uses n_prefix_tokens_full (uncapped) so raw_tokens keeps the complete
          * token sequence for correct text-level matching in the commit phase. */
+        int dropped_repeat_tokens = 0;
+        if (n_chunk_tokens > 0) {
+            int prev_tok = -1;
+            int prev_run = 0;
+            if (n_prefix_tokens_full > 0) {
+                prev_tok = raw_tokens[n_prefix_tokens_full - 1];
+                prev_run = 1;
+                for (int j = n_prefix_tokens_full - 2; j >= 0; j--) {
+                    if (raw_tokens[j] != prev_tok) break;
+                    prev_run++;
+                    if (prev_run >= QWEN_STREAM_MAX_REPEAT_TOKEN_RUN) break;
+                }
+            }
+
+            int out = 0;
+            for (int i = 0; i < n_chunk_tokens; i++) {
+                int tok = chunk_tokens[i];
+                int suppress = 0;
+
+                if (tok == prev_tok) {
+                    prev_run++;
+                    if (prev_run > QWEN_STREAM_MAX_REPEAT_TOKEN_RUN) suppress = 1;
+                } else {
+                    prev_tok = tok;
+                    prev_run = 1;
+                }
+
+                if (suppress) {
+                    dropped_repeat_tokens++;
+                    continue;
+                }
+                chunk_tokens[out++] = tok;
+            }
+            n_chunk_tokens = out;
+        }
+
         int n_raw_new = n_prefix_tokens_full + n_chunk_tokens;
         if (n_raw_new > raw_tokens_cap) {
             while (n_raw_new > raw_tokens_cap) raw_tokens_cap *= 2;
@@ -1744,6 +1901,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
         n_raw_tokens = n_raw_new;
         free(chunk_tokens);
+        if (dropped_repeat_tokens > 0 && qwen_verbose >= 2) {
+            fprintf(stderr, "  Decode: dropped %d repeated tokens\n", dropped_repeat_tokens);
+        }
 
         /* Parse text region from raw stream output:
          * - default: language ... <asr_text> TEXT
@@ -1766,62 +1926,175 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         /* "Fixed" frontier for this chunk:
          * - cold-start chunks: emit nothing,
          * - intermediate chunks: keep last `rollback` text tokens unfixed,
+         *   but if text is shorter than rollback keep only 1 token unfixed so
+         *   streaming still advances,
          * - final chunk: emit everything. */
         int candidate_len = 0;
         if (is_final) {
             candidate_len = n_text_tokens;
         } else if (chunk_idx >= unfixed_chunks) {
             candidate_len = n_text_tokens - rollback;
+            if (candidate_len <= 0 && n_text_tokens > 0) candidate_len = n_text_tokens - 1;
             if (candidate_len < 0) candidate_len = 0;
         }
 
         /* Streaming commit: emit token delta against the previous candidate.
          * We do not attempt monotonic byte-level reconciliation here. */
         int *candidate_tokens = raw_tokens + text_start;
+        int did_recovery_reset = 0;
+        int did_periodic_reset = 0;
         {
-            if (candidate_len > stable_text_cap) {
-                while (candidate_len > stable_text_cap) stable_text_cap *= 2;
-                int *tmp_stable = (int *)realloc(stable_text_tokens,
-                                                 (size_t)stable_text_cap * sizeof(int));
-                if (!tmp_stable) {
-                    candidate_len = n_stable_text_tokens;
-                } else {
-                    stable_text_tokens = tmp_stable;
+            int tail_period = 0;
+            int tail_reps = stream_tail_repeat_blocks(candidate_tokens, candidate_len,
+                                                      QWEN_STREAM_DEGEN_MAX_PERIOD,
+                                                      &tail_period);
+            int candidate_advance = candidate_len - n_stable_text_tokens;
+            if (!is_final && n_generated >= max_new_tokens && candidate_advance <= 1) {
+                stagnant_chunks++;
+            } else {
+                stagnant_chunks = 0;
+            }
+            int recovery_reset = 0;
+            if (tail_period > 0 && tail_reps >= QWEN_STREAM_DEGEN_MIN_REPEATS) {
+                recovery_reset = 1;
+            }
+            if (stagnant_chunks >= QWEN_STREAM_STALE_CHUNKS) {
+                recovery_reset = 1;
+            }
+            if (dropped_repeat_tokens >= 8) {
+                recovery_reset = 1;
+            }
+
+            if (recovery_reset) {
+                if (stream_reanchor_text_state(ctx,
+                                               emitted_text_tokens,
+                                               n_emitted_text_tokens,
+                                               QWEN_STREAM_RESET_CARRY_TOKENS,
+                                               &raw_tokens, &raw_tokens_cap, &n_raw_tokens,
+                                               &stable_text_tokens, &stable_text_cap,
+                                               &n_stable_text_tokens) != 0) {
+                    n_raw_tokens = 0;
+                    n_stable_text_tokens = 0;
+                }
+                prev_prefill_len = 0;
+                stream_clear_enc_cache(enc_cache,
+                                       &n_enc_cache,
+                                       &enc_cache_start,
+                                       &enc_cached_seq_total,
+                                       &next_window_start,
+                                       full_end);
+                stagnant_chunks = 0;
+                did_recovery_reset = 1;
+                if (qwen_monitor) {
+                    fprintf(stderr, "!");
+                    fflush(stderr);
+                }
+            } else {
+                if (candidate_len > stable_text_cap) {
+                    while (candidate_len > stable_text_cap) stable_text_cap *= 2;
+                    int *tmp_stable = (int *)realloc(stable_text_tokens,
+                                                     (size_t)stable_text_cap * sizeof(int));
+                    if (!tmp_stable) {
+                        candidate_len = n_stable_text_tokens;
+                    } else {
+                        stable_text_tokens = tmp_stable;
+                    }
+                }
+
+                int lcp = 0;
+                while (lcp < n_stable_text_tokens &&
+                       lcp < candidate_len &&
+                       stable_text_tokens[lcp] == candidate_tokens[lcp]) {
+                    lcp++;
+                }
+                for (int i = lcp; i < candidate_len; i++) {
+                    stable_text_tokens[i] = candidate_tokens[i];
+                }
+
+                int emit_start = lcp;
+                if (emit_start < candidate_len && n_emitted_text_tokens > 0) {
+                    int max_overlap = candidate_len - emit_start;
+                    if (max_overlap > n_emitted_text_tokens) max_overlap = n_emitted_text_tokens;
+                    if (max_overlap > QWEN_STREAM_OVERLAP_MAX_TOKENS)
+                        max_overlap = QWEN_STREAM_OVERLAP_MAX_TOKENS;
+                    for (int k = max_overlap; k >= QWEN_STREAM_OVERLAP_MIN_TOKENS; k--) {
+                        if (memcmp(emitted_text_tokens + (n_emitted_text_tokens - k),
+                                   candidate_tokens + emit_start,
+                                   (size_t)k * sizeof(int)) == 0) {
+                            emit_start += k;
+                            break;
+                        }
+                    }
+                }
+
+                for (int i = emit_start; i < candidate_len; i++) {
+                    int tok = stable_text_tokens[i];
+                    const char *piece = qwen_tokenizer_decode(tokenizer, tok);
+                    if (ctx->token_cb) ctx->token_cb(piece, ctx->token_cb_userdata);
+
+                    size_t plen = strlen(piece);
+                    if (result_len + plen + 1 > result_cap) {
+                        while (result_len + plen + 1 > result_cap) result_cap *= 2;
+                        result = (char *)realloc(result, result_cap);
+                    }
+                    memcpy(result + result_len, piece, plen);
+                    result_len += plen;
+                    result[result_len] = '\0';
+                    ctx->perf_text_tokens++;
+
+                    if (n_emitted_text_tokens == emitted_text_cap) {
+                        int new_cap = emitted_text_cap * 2;
+                        int *tmp_emit = (int *)realloc(emitted_text_tokens,
+                                                       (size_t)new_cap * sizeof(int));
+                        if (tmp_emit) {
+                            emitted_text_tokens = tmp_emit;
+                            emitted_text_cap = new_cap;
+                        }
+                    }
+                    if (n_emitted_text_tokens < emitted_text_cap) {
+                        emitted_text_tokens[n_emitted_text_tokens++] = tok;
+                    }
+                }
+
+                n_stable_text_tokens = candidate_len;
+
+                int periodic_reset =
+                    (!is_final &&
+                     ctx->past_text_conditioning &&
+                     chunk_idx >= unfixed_chunks &&
+                     ((chunk_idx + 1) % QWEN_STREAM_RESET_INTERVAL_CHUNKS == 0));
+                if (periodic_reset) {
+                    if (stream_reanchor_text_state(ctx,
+                                                   emitted_text_tokens,
+                                                   n_emitted_text_tokens,
+                                                   QWEN_STREAM_RESET_CARRY_TOKENS,
+                                                   &raw_tokens, &raw_tokens_cap, &n_raw_tokens,
+                                                   &stable_text_tokens, &stable_text_cap,
+                                                   &n_stable_text_tokens) != 0) {
+                        n_raw_tokens = 0;
+                        n_stable_text_tokens = 0;
+                    }
+                    prev_prefill_len = 0;
+                    stream_clear_enc_cache(enc_cache,
+                                           &n_enc_cache,
+                                           &enc_cache_start,
+                                           &enc_cached_seq_total,
+                                           &next_window_start,
+                                           full_end);
+                    did_periodic_reset = 1;
                 }
             }
-
-            int lcp = 0;
-            while (lcp < n_stable_text_tokens &&
-                   lcp < candidate_len &&
-                   stable_text_tokens[lcp] == candidate_tokens[lcp]) {
-                lcp++;
-            }
-
-            for (int i = lcp; i < candidate_len; i++) {
-                int tok = candidate_tokens[i];
-                stable_text_tokens[i] = tok;
-
-                const char *piece = qwen_tokenizer_decode(tokenizer, tok);
-                if (ctx->token_cb) ctx->token_cb(piece, ctx->token_cb_userdata);
-
-                size_t plen = strlen(piece);
-                if (result_len + plen + 1 > result_cap) {
-                    while (result_len + plen + 1 > result_cap) result_cap *= 2;
-                    result = (char *)realloc(result, result_cap);
-                }
-                memcpy(result + result_len, piece, plen);
-                result_len += plen;
-                result[result_len] = '\0';
-                ctx->perf_text_tokens++;
-            }
-
-            n_stable_text_tokens = candidate_len;
         }
 
         if (qwen_verbose >= 2) {
             if (prefix_offset > 0)
                 fprintf(stderr, "  Prefix window: %d/%d tokens (offset %d)\n",
                         n_prefix_tokens, n_prefix_tokens_full, prefix_offset);
+            if (did_recovery_reset) {
+                fprintf(stderr, "  Recovery reset applied\n");
+            } else if (did_periodic_reset) {
+                fprintf(stderr, "  Periodic reset applied\n");
+            }
             fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
                     candidate_len, n_stable_text_tokens);
         }
@@ -1863,6 +2136,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     free(prev_prefill_embeds);
     free(raw_tokens);
     free(stable_text_tokens);
+    free(emitted_text_tokens);
     qwen_tokenizer_free(tokenizer);
     free(compacted_samples);
     free(local_samples);

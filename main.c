@@ -67,7 +67,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
     fprintf(stderr, "  --monitor     Show inline Unicode symbols on stderr (streaming diagnostics)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
-    fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
+    fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
+    fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
