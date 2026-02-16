@@ -1080,6 +1080,525 @@ typedef struct {
     float *enc_output; /* [seq_len, dec_hidden] */
 } stream_enc_window_t;
 
+/* Sliding-window limits for long streams: bound encoder tokens and
+ * prefix tokens fed to the decoder so memory/compute stay flat.
+ * 4 windows × 8 s = 32 s of audio context; 150 prefix tokens ≈
+ * 140 text tokens of decoder context. */
+#define QWEN_STREAM_MAX_ENC_WINDOWS  4
+#define QWEN_STREAM_MAX_PREFIX_TOKENS 150
+
+/* ========================================================================
+ * Push-Based Incremental Streaming (qwen_stream_* API)
+ * ======================================================================== */
+
+struct qwen_stream {
+    qwen_ctx_t *ctx;
+    qwen_tokenizer_t *tokenizer;
+
+    /* Audio buffer (owned, grows via qwen_stream_feed) */
+    float *audio_buf;
+    int64_t audio_len;
+    int64_t audio_cap;
+    int64_t audio_cursor;
+
+    /* Chunk control */
+    int chunk_samples;
+    int chunk_idx;
+    int finished;
+
+    /* Encoder cache */
+    stream_enc_window_t *enc_cache;
+    int n_enc_cache;
+    int enc_cache_start;
+    int enc_cache_cap;
+    int enc_cached_seq_total;
+    int enc_window_samples;
+    int64_t next_window_start;
+    int use_enc_cache;
+
+    /* Prefill reuse */
+    float *prev_prefill_embeds;
+    int prev_prefill_len;
+    int prev_prefill_cap;
+
+    /* Token tracking */
+    int *raw_tokens;
+    int n_raw_tokens;
+    int raw_tokens_cap;
+    int *stable_text_tokens;
+    int n_stable_text_tokens;
+    int stable_text_cap;
+    int rollback;
+    int unfixed_chunks;
+    int max_new_tokens;
+
+    /* Token queue (circular buffer) */
+    const char **token_queue;
+    int queue_head;
+    int queue_tail;
+    int queue_cap;
+
+    /* Working buffer */
+    float *tmp_embed;
+
+    /* Stats */
+    double encode_ms;
+    double decode_ms;
+    int prefill_total_tokens;
+    int prefill_reused_tokens;
+};
+
+/* Circular buffer enqueue with grow-on-full. */
+static void stream_enqueue(struct qwen_stream *s, const char *piece) {
+    int next_tail = (s->queue_tail + 1) % s->queue_cap;
+    if (next_tail == s->queue_head) {
+        /* Queue full — double capacity and linearize. */
+        int new_cap = s->queue_cap * 2;
+        const char **new_queue = (const char **)malloc((size_t)new_cap * sizeof(const char *));
+        if (!new_queue) return;
+        int count = 0;
+        int i = s->queue_head;
+        while (i != s->queue_tail) {
+            new_queue[count++] = s->token_queue[i];
+            i = (i + 1) % s->queue_cap;
+        }
+        free(s->token_queue);
+        s->token_queue = new_queue;
+        s->queue_head = 0;
+        s->queue_tail = count;
+        s->queue_cap = new_cap;
+        next_tail = (s->queue_tail + 1) % s->queue_cap;
+    }
+    s->token_queue[s->queue_tail] = piece;
+    s->queue_tail = next_tail;
+}
+
+/* Process one chunk of audio from s->audio_cursor.
+ * Mirrors the inner loop body of stream_impl() operating on struct fields. */
+static int stream_process_chunk(struct qwen_stream *s, int is_final) {
+    qwen_ctx_t *ctx = s->ctx;
+    const qwen_config_t *cfg = &ctx->config;
+    int dim = cfg->dec_hidden;
+
+    if (is_final) {
+        s->audio_cursor = s->audio_len;
+    } else {
+        s->audio_cursor += s->chunk_samples;
+        if (s->audio_cursor > s->audio_len) s->audio_cursor = s->audio_len;
+    }
+
+    if (s->audio_cursor <= 0) {
+        s->chunk_idx++;
+        return 0;
+    }
+
+    /* ---- Encoder ---- */
+    double t0 = get_time_ms();
+    int enc_seq_len = 0;
+    float *enc_output = NULL;
+    int64_t full_end = (s->audio_cursor / s->enc_window_samples) *
+                       (int64_t)s->enc_window_samples;
+
+    if (!s->use_enc_cache) {
+        /* Full recompute fallback */
+        if (s->audio_cursor > INT_MAX) {
+            s->chunk_idx++;
+            return 0;
+        }
+        if (stream_encode_span(ctx, s->audio_buf, (int)s->audio_cursor,
+                               &enc_output, &enc_seq_len) != 0 ||
+            !enc_output || enc_seq_len <= 0) {
+            free(enc_output);
+            s->encode_ms += get_time_ms() - t0;
+            s->chunk_idx++;
+            return 0;
+        }
+        double enc_ms = get_time_ms() - t0;
+        s->encode_ms += enc_ms;
+        if (qwen_verbose >= 2)
+            fprintf(stderr,
+                    "  Encoder: %d tokens from 0.0-%.1f s (full recompute, %.0f ms)\n",
+                    enc_seq_len,
+                    (float)s->audio_cursor / QWEN_SAMPLE_RATE, enc_ms);
+    } else {
+        int enc_failed = 0;
+
+        /* Cache completed local-attention windows. */
+        while (s->next_window_start < full_end) {
+            int64_t ws = s->next_window_start;
+            if (ws < 0 || ws + s->enc_window_samples > s->audio_len) {
+                enc_failed = 1;
+                break;
+            }
+            float *win_enc = NULL;
+            int win_seq = 0;
+            if (stream_encode_span(ctx,
+                                   s->audio_buf + (size_t)ws,
+                                   s->enc_window_samples,
+                                   &win_enc, &win_seq) != 0 ||
+                !win_enc || win_seq <= 0) {
+                free(win_enc);
+                enc_failed = 1;
+                break;
+            }
+
+            if (s->n_enc_cache == s->enc_cache_cap) {
+                int new_cap = s->enc_cache_cap > 0 ? s->enc_cache_cap * 2 : 8;
+                stream_enc_window_t *tmp = (stream_enc_window_t *)realloc(
+                    s->enc_cache, (size_t)new_cap * sizeof(stream_enc_window_t));
+                if (!tmp) {
+                    free(win_enc);
+                    enc_failed = 1;
+                    break;
+                }
+                s->enc_cache = tmp;
+                s->enc_cache_cap = new_cap;
+            }
+
+            s->enc_cache[s->n_enc_cache].start_sample = ws;
+            s->enc_cache[s->n_enc_cache].n_samples = s->enc_window_samples;
+            s->enc_cache[s->n_enc_cache].seq_len = win_seq;
+            s->enc_cache[s->n_enc_cache].enc_output = win_enc;
+            s->n_enc_cache++;
+            s->enc_cached_seq_total += win_seq;
+            s->next_window_start += s->enc_window_samples;
+        }
+
+        /* Encode the current partial tail window. */
+        float *partial_enc = NULL;
+        int partial_seq = 0;
+        if (!enc_failed && full_end < s->audio_cursor) {
+            int64_t partial_samples64 = s->audio_cursor - full_end;
+            if (partial_samples64 > INT_MAX ||
+                full_end + partial_samples64 > s->audio_len) {
+                enc_failed = 1;
+            } else if (stream_encode_span(ctx,
+                                   s->audio_buf + (size_t)full_end,
+                                   (int)partial_samples64,
+                                   &partial_enc, &partial_seq) != 0) {
+                free(partial_enc);
+                partial_enc = NULL;
+                enc_failed = 1;
+            }
+        }
+
+        if (enc_failed) {
+            free(partial_enc);
+            s->encode_ms += get_time_ms() - t0;
+            s->chunk_idx++;
+            return 0;
+        }
+
+        /* Evict old encoder windows beyond the sliding-window limit. */
+        {
+            int evicted = 0;
+            while (s->n_enc_cache - s->enc_cache_start > QWEN_STREAM_MAX_ENC_WINDOWS) {
+                s->enc_cached_seq_total -= s->enc_cache[s->enc_cache_start].seq_len;
+                free(s->enc_cache[s->enc_cache_start].enc_output);
+                s->enc_cache[s->enc_cache_start].enc_output = NULL;
+                s->enc_cache_start++;
+                evicted++;
+            }
+            if (evicted && qwen_monitor) {
+                fprintf(stderr, "\xe2\x9f\xb3");  /* ⟳ = window eviction */
+                fflush(stderr);
+            }
+        }
+
+        enc_seq_len = s->enc_cached_seq_total + partial_seq;
+        if (enc_seq_len <= 0) {
+            free(partial_enc);
+            s->encode_ms += get_time_ms() - t0;
+            s->chunk_idx++;
+            return 0;
+        }
+
+        enc_output = (float *)malloc((size_t)enc_seq_len * dim * sizeof(float));
+        if (!enc_output) {
+            free(partial_enc);
+            s->encode_ms += get_time_ms() - t0;
+            s->chunk_idx++;
+            return 0;
+        }
+
+        int enc_off = 0;
+        for (int i = s->enc_cache_start; i < s->n_enc_cache; i++) {
+            memcpy(enc_output + (size_t)enc_off * dim,
+                   s->enc_cache[i].enc_output,
+                   (size_t)s->enc_cache[i].seq_len * dim * sizeof(float));
+            enc_off += s->enc_cache[i].seq_len;
+        }
+        if (partial_seq > 0 && partial_enc) {
+            memcpy(enc_output + (size_t)enc_off * dim,
+                   partial_enc, (size_t)partial_seq * dim * sizeof(float));
+        }
+        free(partial_enc);
+
+        double enc_ms = get_time_ms() - t0;
+        s->encode_ms += enc_ms;
+        if (qwen_verbose >= 2)
+            fprintf(stderr,
+                    "  Encoder: %d tokens from 0.0-%.1f s "
+                    "(cached windows=%d, partial=%.1f s, %.0f ms)\n",
+                    enc_seq_len,
+                    (float)s->audio_cursor / QWEN_SAMPLE_RATE,
+                    s->n_enc_cache - s->enc_cache_start,
+                    (float)(s->audio_cursor - full_end) / QWEN_SAMPLE_RATE,
+                    enc_ms);
+        if (qwen_monitor) {
+            fprintf(stderr, "\xe2\x96\xb6");  /* ▶ = encoder */
+            fflush(stderr);
+        }
+    }
+
+    /* ---- Prefix rollback ---- */
+    int n_prefix_tokens_full = 0;
+    int n_prefix_tokens = 0;
+    int prefix_offset = 0;
+    if (ctx->past_text_conditioning &&
+        s->chunk_idx >= s->unfixed_chunks && s->n_raw_tokens > 0) {
+        n_prefix_tokens_full = s->n_raw_tokens - s->rollback;
+        if (n_prefix_tokens_full < 0) n_prefix_tokens_full = 0;
+        n_prefix_tokens = n_prefix_tokens_full;
+        if (n_prefix_tokens > QWEN_STREAM_MAX_PREFIX_TOKENS) {
+            n_prefix_tokens = QWEN_STREAM_MAX_PREFIX_TOKENS;
+            prefix_offset = n_prefix_tokens_full - n_prefix_tokens;
+        }
+    }
+
+    /* ---- Build input embeddings ---- */
+    int prefix_len = PREFIX_HEAD_LEN + ctx->n_prompt_tokens + PREFIX_TAIL_LEN;
+    int suffix_len = SUFFIX_BASE_LEN + ctx->n_force_prompt_tokens;
+    int total_seq = prefix_len + enc_seq_len + suffix_len + n_prefix_tokens;
+    float *input_embeds = (float *)malloc((size_t)total_seq * dim * sizeof(float));
+    if (!input_embeds) {
+        free(enc_output);
+        s->chunk_idx++;
+        return 0;
+    }
+
+    int off = 0;
+    for (int i = 0; i < PREFIX_HEAD_LEN; i++) {
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              PROMPT_PREFIX_HEAD[i], dim);
+        off++;
+    }
+    for (int i = 0; i < ctx->n_prompt_tokens; i++) {
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              ctx->prompt_tokens[i], dim);
+        off++;
+    }
+    for (int i = 0; i < PREFIX_TAIL_LEN; i++) {
+        tok_embed_bf16_to_f32(input_embeds + off * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              PROMPT_PREFIX_TAIL[i], dim);
+        off++;
+    }
+
+    for (int i = 0; i < enc_seq_len; i++)
+        memcpy(input_embeds + (prefix_len + i) * dim,
+               enc_output + i * dim, dim * sizeof(float));
+    free(enc_output);
+    enc_output = NULL;
+
+    int suffix_off = prefix_len + enc_seq_len;
+    for (int i = 0; i < SUFFIX_BASE_LEN; i++)
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              PROMPT_SUFFIX_BASE[i], dim);
+
+    for (int i = 0; i < ctx->n_force_prompt_tokens; i++)
+        tok_embed_bf16_to_f32(input_embeds + (suffix_off + SUFFIX_BASE_LEN + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              ctx->force_prompt_tokens[i], dim);
+
+    int text_off = suffix_off + suffix_len;
+    for (int i = 0; i < n_prefix_tokens; i++)
+        tok_embed_bf16_to_f32(input_embeds + (text_off + i) * dim,
+                              ctx->decoder.tok_embeddings_bf16,
+                              s->raw_tokens[prefix_offset + i], dim);
+
+    /* ---- Decoder prefill + first token ---- */
+    t0 = get_time_ms();
+    int prefill_len = total_seq - 1;
+    int reused_prefill = 0;
+    if (s->prev_prefill_embeds && s->prev_prefill_len > 0) {
+        int cmp_len = prefill_len < s->prev_prefill_len
+                      ? prefill_len : s->prev_prefill_len;
+        size_t row_bytes = (size_t)dim * sizeof(float);
+        while (reused_prefill < cmp_len) {
+            const float *a = s->prev_prefill_embeds + (size_t)reused_prefill * dim;
+            const float *b = input_embeds + (size_t)reused_prefill * dim;
+            if (memcmp(a, b, row_bytes) != 0) break;
+            reused_prefill++;
+        }
+    }
+    ctx->kv_cache_len = reused_prefill;
+    int delta_prefill = prefill_len - reused_prefill;
+    if (delta_prefill > 0) {
+        qwen_decoder_prefill(ctx,
+                             input_embeds + (size_t)reused_prefill * dim,
+                             delta_prefill);
+    }
+    s->prefill_total_tokens += prefill_len;
+    s->prefill_reused_tokens += reused_prefill;
+
+    float *last_embed = input_embeds + (size_t)prefill_len * dim;
+    int token = qwen_decoder_forward(ctx, last_embed);
+
+    if (prefill_len > s->prev_prefill_cap) {
+        int new_cap = s->prev_prefill_cap > 0 ? s->prev_prefill_cap : 64;
+        while (new_cap < prefill_len) new_cap *= 2;
+        float *tmp_prev = (float *)realloc(s->prev_prefill_embeds,
+                                           (size_t)new_cap * dim * sizeof(float));
+        if (tmp_prev) {
+            s->prev_prefill_embeds = tmp_prev;
+            s->prev_prefill_cap = new_cap;
+        } else {
+            s->prev_prefill_len = 0;
+        }
+    }
+    if (s->prev_prefill_embeds && s->prev_prefill_cap >= prefill_len) {
+        memcpy(s->prev_prefill_embeds, input_embeds,
+               (size_t)prefill_len * dim * sizeof(float));
+        s->prev_prefill_len = prefill_len;
+    } else {
+        s->prev_prefill_len = 0;
+    }
+    free(input_embeds);
+
+    double prefill_ms = get_time_ms() - t0;
+    s->decode_ms += prefill_ms;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Prefill: %d tokens (%d prefix, reused %d) (%.0f ms)\n",
+                total_seq, n_prefix_tokens, reused_prefill, prefill_ms);
+    if (qwen_monitor) {
+        fprintf(stderr, "\xc2\xb7");  /* · = prefill */
+        fflush(stderr);
+    }
+
+    /* ---- Autoregressive decode ---- */
+    t0 = get_time_ms();
+    int n_generated = 0;
+    int *chunk_tokens = (int *)malloc((size_t)s->max_new_tokens * sizeof(int));
+    if (!chunk_tokens) {
+        s->chunk_idx++;
+        return 0;
+    }
+    int n_chunk_tokens = 0;
+
+    while (n_generated < s->max_new_tokens) {
+        n_generated++;
+        if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
+        chunk_tokens[n_chunk_tokens++] = token;
+        tok_embed_bf16_to_f32(s->tmp_embed, ctx->decoder.tok_embeddings_bf16,
+                              token, dim);
+        token = qwen_decoder_forward(ctx, s->tmp_embed);
+    }
+
+    double decode_ms = get_time_ms() - t0;
+    s->decode_ms += decode_ms;
+    if (qwen_verbose >= 2)
+        fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s)\n",
+                n_generated, decode_ms,
+                n_generated > 0 ? decode_ms / n_generated : 0,
+                (n_generated >= s->max_new_tokens &&
+                 token != QWEN_TOKEN_ENDOFTEXT &&
+                 token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "");
+    if (qwen_monitor) {
+        double ms_per_tok = n_generated > 0 ? decode_ms / n_generated : 0;
+        fprintf(stderr, "%s", ms_per_tok > 30 ? "\xe2\x96\xb8" : "\xe2\x96\xaa");
+        fflush(stderr);
+    }
+
+    /* ---- Update raw token history ---- */
+    int n_raw_new = n_prefix_tokens_full + n_chunk_tokens;
+    if (n_raw_new > s->raw_tokens_cap) {
+        while (n_raw_new > s->raw_tokens_cap) s->raw_tokens_cap *= 2;
+        int *tmp_raw = (int *)realloc(s->raw_tokens,
+                                      (size_t)s->raw_tokens_cap * sizeof(int));
+        if (!tmp_raw) {
+            free(chunk_tokens);
+            s->chunk_idx++;
+            return 0;
+        }
+        s->raw_tokens = tmp_raw;
+    }
+    if (n_chunk_tokens > 0) {
+        memcpy(s->raw_tokens + n_prefix_tokens_full, chunk_tokens,
+               (size_t)n_chunk_tokens * sizeof(int));
+    }
+    s->n_raw_tokens = n_raw_new;
+    free(chunk_tokens);
+
+    /* ---- Commit stable tokens ---- */
+    int text_start = 0;
+    if (ctx->n_force_prompt_tokens <= 0) {
+        int asr_text_pos = -1;
+        for (int i = 0; i < s->n_raw_tokens; i++) {
+            if (s->raw_tokens[i] == QWEN_TOKEN_ASR_TEXT) {
+                asr_text_pos = i;
+                break;
+            }
+        }
+        text_start = (asr_text_pos >= 0) ? asr_text_pos + 1 : 0;
+    }
+    if (text_start < 0) text_start = 0;
+    if (text_start > s->n_raw_tokens) text_start = s->n_raw_tokens;
+    int n_text_tokens = s->n_raw_tokens - text_start;
+
+    int candidate_len = 0;
+    if (is_final) {
+        candidate_len = n_text_tokens;
+    } else if (s->chunk_idx >= s->unfixed_chunks) {
+        candidate_len = n_text_tokens - s->rollback;
+        if (candidate_len < 0) candidate_len = 0;
+    }
+
+    int *candidate_tokens = s->raw_tokens + text_start;
+    {
+        if (candidate_len > s->stable_text_cap) {
+            while (candidate_len > s->stable_text_cap) s->stable_text_cap *= 2;
+            int *tmp_stable = (int *)realloc(s->stable_text_tokens,
+                                             (size_t)s->stable_text_cap * sizeof(int));
+            if (!tmp_stable) {
+                candidate_len = s->n_stable_text_tokens;
+            } else {
+                s->stable_text_tokens = tmp_stable;
+            }
+        }
+
+        int lcp = 0;
+        while (lcp < s->n_stable_text_tokens &&
+               lcp < candidate_len &&
+               s->stable_text_tokens[lcp] == candidate_tokens[lcp]) {
+            lcp++;
+        }
+
+        for (int i = lcp; i < candidate_len; i++) {
+            int tok = candidate_tokens[i];
+            s->stable_text_tokens[i] = tok;
+            const char *piece = qwen_tokenizer_decode(s->tokenizer, tok);
+            stream_enqueue(s, piece);
+        }
+
+        s->n_stable_text_tokens = candidate_len;
+    }
+
+    if (qwen_verbose >= 2) {
+        if (prefix_offset > 0)
+            fprintf(stderr, "  Prefix window: %d/%d tokens (offset %d)\n",
+                    n_prefix_tokens, n_prefix_tokens_full, prefix_offset);
+        fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
+                candidate_len, s->n_stable_text_tokens);
+    }
+
+    s->chunk_idx++;
+    return 0;
+}
+
 /* ========================================================================
  * Streaming Transcription (chunked rollback + encoder window cache)
  *
@@ -1199,9 +1718,6 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
      * 4 windows × 8 s = 32 s of audio context; 150 prefix tokens ≈
      * 140 text tokens of decoder context.  raw_tokens array itself
      * grows unbounded (negligible memory) for correct text matching. */
-    #define QWEN_STREAM_MAX_ENC_WINDOWS  4
-    #define QWEN_STREAM_MAX_PREFIX_TOKENS 150
-
     if (qwen_verbose >= 2) {
         if (live)
             fprintf(stderr,
@@ -1883,6 +2399,157 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
 
 char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live) {
     return stream_impl(ctx, NULL, 0, live);
+}
+
+/* ========================================================================
+ * Push-Based Incremental Streaming API (qwen_stream_*)
+ * ======================================================================== */
+
+qwen_stream_t *qwen_stream_init(qwen_ctx_t *ctx) {
+    if (!ctx) return NULL;
+
+    struct qwen_stream *s = (struct qwen_stream *)calloc(1, sizeof(struct qwen_stream));
+    if (!s) return NULL;
+    s->ctx = ctx;
+
+    /* Load tokenizer */
+    char vocab_path[1024];
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", ctx->model_dir);
+    s->tokenizer = qwen_tokenizer_load(vocab_path);
+    if (!s->tokenizer) {
+        free(s);
+        return NULL;
+    }
+    if (prepare_prompt_tokens(ctx, s->tokenizer) != 0) {
+        qwen_tokenizer_free(s->tokenizer);
+        free(s);
+        return NULL;
+    }
+
+    /* Chunk parameters from ctx */
+    s->chunk_samples = (int)(ctx->stream_chunk_sec * QWEN_SAMPLE_RATE);
+    s->rollback = ctx->stream_rollback;
+    s->unfixed_chunks = ctx->stream_unfixed_chunks;
+    s->max_new_tokens = ctx->stream_max_new_tokens > 0
+                        ? ctx->stream_max_new_tokens : 32;
+
+    /* Encoder window setup */
+    int enc_window_frames = ctx->config.enc_n_window_infer;
+    if (enc_window_frames < 100) enc_window_frames = 100;
+    if (enc_window_frames > 800) enc_window_frames = 800;
+    s->enc_window_samples = enc_window_frames * QWEN_HOP_LENGTH;
+
+    const char *no_cache_env = getenv("QWEN_STREAM_NO_ENC_CACHE");
+    s->use_enc_cache = 1;
+    if (no_cache_env && no_cache_env[0] != '\0' && strcmp(no_cache_env, "0") != 0)
+        s->use_enc_cache = 0;
+
+    /* Audio buffer */
+    s->audio_cap = (int64_t)s->chunk_samples * 4;
+    s->audio_buf = (float *)malloc((size_t)s->audio_cap * sizeof(float));
+    if (!s->audio_buf) {
+        qwen_tokenizer_free(s->tokenizer);
+        free(s);
+        return NULL;
+    }
+
+    /* Token arrays */
+    s->raw_tokens_cap = 8192;
+    s->raw_tokens = (int *)malloc((size_t)s->raw_tokens_cap * sizeof(int));
+    s->stable_text_cap = 8192;
+    s->stable_text_tokens = (int *)malloc((size_t)s->stable_text_cap * sizeof(int));
+
+    /* Token queue */
+    s->queue_cap = 256;
+    s->token_queue = (const char **)malloc((size_t)s->queue_cap * sizeof(const char *));
+
+    /* Working buffer */
+    int dim = ctx->config.dec_hidden;
+    s->tmp_embed = (float *)malloc((size_t)dim * sizeof(float));
+
+    if (!s->raw_tokens || !s->stable_text_tokens ||
+        !s->token_queue || !s->tmp_embed) {
+        qwen_stream_free(s);
+        return NULL;
+    }
+
+    /* Reset KV cache */
+    ctx->kv_cache_len = 0;
+
+    return s;
+}
+
+int qwen_stream_feed(qwen_stream_t *s, const float *samples, int n_samples) {
+    if (!s || s->finished) return -1;
+    if (!samples || n_samples <= 0) return 0;
+
+    /* Grow audio buffer if needed */
+    int64_t need = s->audio_len + (int64_t)n_samples;
+    if (need > s->audio_cap) {
+        int64_t new_cap = s->audio_cap > 0 ? s->audio_cap : 32000;
+        while (new_cap < need) new_cap *= 2;
+        if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float)))
+            return -1;
+        float *tmp = (float *)realloc(s->audio_buf,
+                                      (size_t)new_cap * sizeof(float));
+        if (!tmp) return -1;
+        s->audio_buf = tmp;
+        s->audio_cap = new_cap;
+    }
+
+    memcpy(s->audio_buf + s->audio_len, samples,
+           (size_t)n_samples * sizeof(float));
+    s->audio_len += n_samples;
+
+    /* Process complete chunks */
+    while (s->audio_cursor + s->chunk_samples <= s->audio_len)
+        stream_process_chunk(s, 0);
+
+    return 0;
+}
+
+int qwen_stream_get(qwen_stream_t *s, const char **out_tokens, int max_tokens) {
+    if (!s || !out_tokens || max_tokens <= 0) return 0;
+
+    int count = 0;
+    while (s->queue_head != s->queue_tail && count < max_tokens) {
+        out_tokens[count++] = s->token_queue[s->queue_head];
+        s->queue_head = (s->queue_head + 1) % s->queue_cap;
+    }
+    return count;
+}
+
+int qwen_stream_finish(qwen_stream_t *s) {
+    if (!s || s->finished) return -1;
+    s->finished = 1;
+
+    /* Process remaining audio as the final chunk. */
+    if (s->audio_cursor < s->audio_len)
+        stream_process_chunk(s, 1);
+
+    return 0;
+}
+
+void qwen_stream_free(qwen_stream_t *s) {
+    if (!s) return;
+
+    free(s->audio_buf);
+    for (int i = s->enc_cache_start; i < s->n_enc_cache; i++)
+        free(s->enc_cache[i].enc_output);
+    free(s->enc_cache);
+    free(s->prev_prefill_embeds);
+    free(s->raw_tokens);
+    free(s->stable_text_tokens);
+    free(s->token_queue);
+    free(s->tmp_embed);
+    if (s->tokenizer) qwen_tokenizer_free(s->tokenizer);
+    free(s);
+}
+
+void qwen_stream_set_interval(qwen_stream_t *s, float seconds) {
+    if (!s) return;
+    if (seconds < 0.1f) seconds = 0.1f;
+    s->chunk_samples = (int)(seconds * QWEN_SAMPLE_RATE);
 }
 
 char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path) {

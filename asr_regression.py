@@ -383,6 +383,93 @@ def run_stream_stdin_regression(
     return 0
 
 
+def transcribe_stream_push(
+    binary: Path,
+    model_dir: Path,
+    wav: Path,
+    timeout_s: int,
+    extra_args: Sequence[str],
+    show_output: bool = False,
+) -> str:
+    cmd = [str(binary), "-d", str(model_dir), "-i", str(wav), "--stream-push"]
+    if not show_output:
+        cmd.append("--silent")
+    cmd += list(extra_args)
+
+    t0 = time.monotonic()
+    rc, out, err = run_once(cmd, timeout_s, show_output=show_output)
+    if rc != 0:
+        msg = err or f"exit code {rc}"
+        raise RuntimeError(f"stream-push transcription failed for {wav}: {msg}")
+    if show_output and out and not show_output:
+        print(out)
+    return out
+
+
+def run_stream_push_regression(
+    samples_root: Path,
+    binary: Path,
+    model_dir: Path,
+    timeout_s: int,
+    extra_args: Sequence[str],
+    max_norm_rate: float,
+    max_exact_rate: float,
+    show_output: bool = False,
+) -> int:
+    target = samples_root / "jfk.wav"
+    target_ref = target.with_suffix(".txt")
+    if not target.exists() or not target_ref.exists():
+        print(f"{C_BYELLOW}[SKIP stream-push-check]{C_RESET} missing sample/reference: {target}")
+        return 0
+
+    if any(a in ("-S", "--segment-overlap", "--stream", "--stdin",
+                 "--stream-push", "--past-text") for a in extra_args):
+        print(f"{C_BYELLOW}[SKIP stream-push-check]{C_RESET} explicit segmentation/stream args provided")
+        return 0
+
+    print(f"{C_BCYAN}[.... stream-push-check]{C_RESET} transcribing via --stream-push...", flush=True)
+    t0 = time.monotonic()
+    pred = transcribe_stream_push(
+        binary=binary,
+        model_dir=model_dir,
+        wav=target,
+        timeout_s=timeout_s,
+        extra_args=extra_args,
+        show_output=show_output,
+    )
+    elapsed = time.monotonic() - t0
+
+    ref = target_ref.read_text(encoding="utf-8").strip()
+    exact_dist = levenshtein(pred, ref)
+    exact_den = max(1, len(ref))
+    exact_rate = exact_dist / exact_den
+
+    norm_ref = normalize_text(ref)
+    norm_pred = normalize_text(pred)
+    norm_dist = levenshtein(norm_pred, norm_ref)
+    norm_den = max(1, len(norm_ref))
+    norm_rate = norm_dist / norm_den
+
+    ok = (norm_rate <= max_norm_rate) and (exact_rate <= max_exact_rate)
+    if not ok:
+        print(
+            f"[DONE: {C_RED}FAIL{C_RESET}] stream-push-check jfk.wav | "
+            f"exact {exact_dist}/{exact_den} ({C_RED}{exact_rate:.3f}{C_RESET}) | "
+            f"norm {norm_dist}/{norm_den} ({C_RED}{norm_rate:.3f}{C_RESET}) | "
+            f"{C_DIM}{fmt_time(elapsed)}{C_RESET}"
+        )
+        show_text_diff("ref", ref, "got", pred)
+        return 1
+
+    print(
+        f"[DONE: {C_GREEN}OK{C_RESET}] stream-push-check jfk.wav | "
+        f"exact {exact_dist}/{exact_den} ({C_GREEN}{exact_rate:.3f}{C_RESET}) | "
+        f"norm {norm_dist}/{norm_den} ({C_GREEN}{norm_rate:.3f}{C_RESET}) | "
+        f"{C_DIM}{fmt_time(elapsed)}{C_RESET}"
+    )
+    return 0
+
+
 def run_stream_cache_once(
     binary: Path,
     model_dir: Path,
@@ -709,6 +796,16 @@ def parse_args() -> argparse.Namespace:
         help="Skip streaming stdin regression check",
     )
     ap.add_argument(
+        "--stream-push-check-only",
+        action="store_true",
+        help="Run only push-based streaming API regression check",
+    )
+    ap.add_argument(
+        "--skip-stream-push-check",
+        action="store_true",
+        help="Skip push-based streaming API regression check",
+    )
+    ap.add_argument(
         "--stream-cache-check-only",
         action="store_true",
         help="Run only stream cache on/off equivalence regression check",
@@ -784,10 +881,12 @@ def main() -> int:
     )
 
     focused_count = sum(
-        1 for f in (args.segment_check_only, args.stream_check_only, args.stream_cache_check_only) if f
+        1 for f in (args.segment_check_only, args.stream_check_only,
+                     args.stream_push_check_only, args.stream_cache_check_only) if f
     )
     if focused_count > 1:
-        print("--segment-check-only, --stream-check-only and --stream-cache-check-only are mutually exclusive",
+        print("--segment-check-only, --stream-check-only, --stream-push-check-only "
+              "and --stream-cache-check-only are mutually exclusive",
               file=sys.stderr)
         return 2
 
@@ -797,6 +896,9 @@ def main() -> int:
     if args.stream_check_only and (args.generate_missing or args.refresh_refs):
         print("--stream-check-only cannot be combined with reference generation", file=sys.stderr)
         return 2
+    if args.stream_push_check_only and (args.generate_missing or args.refresh_refs):
+        print("--stream-push-check-only cannot be combined with reference generation", file=sys.stderr)
+        return 2
     if args.stream_cache_check_only and (args.generate_missing or args.refresh_refs):
         print("--stream-cache-check-only cannot be combined with reference generation", file=sys.stderr)
         return 2
@@ -804,19 +906,21 @@ def main() -> int:
     show_output = True
 
     should_generate = args.generate_missing or args.refresh_refs
-    any_focused_only = args.segment_check_only or args.stream_check_only or args.stream_cache_check_only
+    any_focused_only = (args.segment_check_only or args.stream_check_only or
+                        args.stream_push_check_only or args.stream_cache_check_only)
 
-    run_segment = (not args.skip_segment_check and
-                   not args.stream_check_only and
-                   not args.stream_cache_check_only)
-    run_stream = (not args.skip_stream_check and
-                  not args.segment_check_only and
-                  not args.stream_cache_check_only)
-    run_stream_cache = (not args.skip_stream_cache_check and
-                        not args.segment_check_only and
-                        not args.stream_check_only)
+    other_focused = lambda *names: any(
+        getattr(args, n) for n in (
+            "segment_check_only", "stream_check_only",
+            "stream_push_check_only", "stream_cache_check_only",
+        ) if n not in names
+    )
+    run_segment = (not args.skip_segment_check and not other_focused("segment_check_only"))
+    run_stream = (not args.skip_stream_check and not other_focused("stream_check_only"))
+    run_stream_push = (not args.skip_stream_push_check and not other_focused("stream_push_check_only"))
+    run_stream_cache = (not args.skip_stream_cache_check and not other_focused("stream_cache_check_only"))
 
-    need_primary_model = should_generate or run_segment or run_stream or (not any_focused_only)
+    need_primary_model = should_generate or run_segment or run_stream or run_stream_push or (not any_focused_only)
     model_dir = Path(args.model_dir).resolve()
     if need_primary_model and not model_dir.exists():
         print(f"missing model dir: {model_dir}", file=sys.stderr)
@@ -853,6 +957,18 @@ def main() -> int:
 
     if run_stream:
         failures += run_stream_stdin_regression(
+            samples_root=samples_root,
+            binary=binary,
+            model_dir=model_dir,
+            timeout_s=args.timeout_s,
+            extra_args=args.arg,
+            max_norm_rate=args.max_norm_rate,
+            max_exact_rate=args.max_exact_rate,
+            show_output=show_output,
+        )
+
+    if run_stream_push:
+        failures += run_stream_push_regression(
             samples_root=samples_root,
             binary=binary,
             model_dir=model_dir,
