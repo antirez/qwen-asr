@@ -57,6 +57,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -S <secs>     Segment target seconds (default: 0 = full-audio decode)\n");
     fprintf(stderr, "  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)\n");
     fprintf(stderr, "  --stream      Streaming mode: process in chunks with prefix rollback\n");
+    fprintf(stderr, "  --stream-push Push-based streaming: feed audio incrementally via library API\n");
     fprintf(stderr, "  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)\n");
     fprintf(stderr, "  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)\n");
     fprintf(stderr, "  --past-text <yes|no|auto>  Reuse previously decoded text as context for the next\n");
@@ -80,6 +81,7 @@ int main(int argc, char **argv) {
     float segment_sec = -1; /* -1 = use default (0) */
     float search_sec = -1;  /* -1 = use default (3) */
     int stream_mode = 0;
+    int stream_push_mode = 0;
     int stream_max_new_tokens = -1; /* -1 = use default (32) */
     float enc_window_sec = -1;   /* -1 = use default (8s) */
     const char *prompt_text = NULL;
@@ -101,6 +103,8 @@ int main(int argc, char **argv) {
             search_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--stream") == 0) {
             stream_mode = 1;
+        } else if (strcmp(argv[i], "--stream-push") == 0) {
+            stream_push_mode = 1;
         } else if (strcmp(argv[i], "--stream-max-new-tokens") == 0 && i + 1 < argc) {
             stream_max_new_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--enc-window-sec") == 0 && i + 1 < argc) {
@@ -154,6 +158,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: -i and --stdin are mutually exclusive\n");
         return 1;
     }
+    if (stream_push_mode && stream_mode) {
+        fprintf(stderr, "Error: --stream and --stream-push are mutually exclusive\n");
+        return 1;
+    }
+    if (stream_push_mode && use_stdin) {
+        fprintf(stderr, "Error: --stream-push requires -i (does not support --stdin)\n");
+        return 1;
+    }
+    if (stream_push_mode && !input_wav) {
+        fprintf(stderr, "Error: --stream-push requires -i <file>\n");
+        return 1;
+    }
 
     qwen_verbose = verbosity;
     emit_tokens = (verbosity > 0);
@@ -181,7 +197,7 @@ int main(int argc, char **argv) {
     if (stream_max_new_tokens > 0) ctx->stream_max_new_tokens = stream_max_new_tokens;
     if (past_text_conditioning_mode >= 0)
         ctx->past_text_conditioning = past_text_conditioning_mode;
-    else if (stream_mode)
+    else if (stream_mode || stream_push_mode)
         /* Official streaming path uses prefix rollback by default.
          * Keep segmented mode default unchanged (off). */
         ctx->past_text_conditioning = 1;
@@ -206,7 +222,74 @@ int main(int argc, char **argv) {
 
     /* Transcribe */
     char *text = NULL;
-    if (stream_mode && use_stdin) {
+    if (stream_push_mode) {
+        /* Push-based streaming via qwen_stream_* API */
+        int ns = 0;
+        float *samps = qwen_load_wav(input_wav, &ns);
+        if (samps) {
+            qwen_stream_t *stream = qwen_stream_init(ctx);
+            if (stream) {
+                size_t text_cap = 4096;
+                size_t text_len = 0;
+                char *tbuf = (char *)malloc(text_cap);
+                tbuf[0] = '\0';
+                int chunk = (int)(ctx->stream_chunk_sec * QWEN_SAMPLE_RATE);
+                int pos = 0;
+
+                while (pos < ns) {
+                    int n = chunk;
+                    if (pos + n > ns) n = ns - pos;
+                    qwen_stream_feed(stream, samps + pos, n);
+                    pos += n;
+
+                    const char *toks[64];
+                    int nt;
+                    while ((nt = qwen_stream_get(stream, toks, 64)) > 0) {
+                        for (int j = 0; j < nt; j++) {
+                            size_t plen = strlen(toks[j]);
+                            if (text_len + plen + 1 > text_cap) {
+                                while (text_len + plen + 1 > text_cap) text_cap *= 2;
+                                tbuf = (char *)realloc(tbuf, text_cap);
+                            }
+                            memcpy(tbuf + text_len, toks[j], plen);
+                            text_len += plen;
+                            tbuf[text_len] = '\0';
+                            if (emit_tokens) {
+                                fputs(toks[j], stdout);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                }
+
+                qwen_stream_finish(stream);
+                {
+                    const char *toks[64];
+                    int nt;
+                    while ((nt = qwen_stream_get(stream, toks, 64)) > 0) {
+                        for (int j = 0; j < nt; j++) {
+                            size_t plen = strlen(toks[j]);
+                            if (text_len + plen + 1 > text_cap) {
+                                while (text_len + plen + 1 > text_cap) text_cap *= 2;
+                                tbuf = (char *)realloc(tbuf, text_cap);
+                            }
+                            memcpy(tbuf + text_len, toks[j], plen);
+                            text_len += plen;
+                            tbuf[text_len] = '\0';
+                            if (emit_tokens) {
+                                fputs(toks[j], stdout);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                }
+
+                qwen_stream_free(stream);
+                text = tbuf;
+            }
+            free(samps);
+        }
+    } else if (stream_mode && use_stdin) {
         /* Live incremental streaming from stdin */
         qwen_live_audio_t *live = qwen_live_audio_start_stdin();
         if (live) {

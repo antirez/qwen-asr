@@ -303,6 +303,52 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
 char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
 
 /* ========================================================================
+ * Push-Based Incremental Streaming API
+ *
+ * Feed audio incrementally and pull decoded tokens, without blocking on
+ * a complete file or stdin thread.
+ *
+ * Usage:
+ *   qwen_stream_t *s = qwen_stream_init(ctx);
+ *   while (have_audio) {
+ *       qwen_stream_feed(s, samples, n);
+ *       const char *tokens[64];
+ *       int n = qwen_stream_get(s, tokens, 64);
+ *       for (int i = 0; i < n; i++) printf("%s", tokens[i]);
+ *   }
+ *   qwen_stream_finish(s);
+ *   // drain remaining tokens with qwen_stream_get
+ *   qwen_stream_free(s);
+ * ======================================================================== */
+
+typedef struct qwen_stream qwen_stream_t;
+
+/* Initialize a push-based streaming session.
+ * The ctx must remain valid for the lifetime of the stream.
+ * Returns NULL on failure. */
+qwen_stream_t *qwen_stream_init(qwen_ctx_t *ctx);
+
+/* Feed audio samples (mono float32, 16 kHz). Internally processes complete
+ * chunks as they accumulate. Returns 0 on success, -1 on error. */
+int qwen_stream_feed(qwen_stream_t *s, const float *samples, int n_samples);
+
+/* Retrieve decoded token strings. Fills out_tokens with up to max_tokens
+ * pointers. Each pointer is valid until qwen_stream_free() is called.
+ * Returns the number of tokens written. */
+int qwen_stream_get(qwen_stream_t *s, const char **out_tokens, int max_tokens);
+
+/* Signal end of audio. Processes any remaining samples as the final chunk
+ * and emits all pending tokens. Returns 0 on success, -1 on error. */
+int qwen_stream_finish(qwen_stream_t *s);
+
+/* Free the streaming session and all associated resources. */
+void qwen_stream_free(qwen_stream_t *s);
+
+/* Change the chunk interval (default comes from ctx->stream_chunk_sec).
+ * Must be called before the first qwen_stream_feed for full effect. */
+void qwen_stream_set_interval(qwen_stream_t *s, float seconds);
+
+/* ========================================================================
  * Internal Functions
  * ======================================================================== */
 
