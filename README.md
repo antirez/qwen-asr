@@ -388,6 +388,135 @@ sudo apt install libopenblas-dev
 sudo dnf install openblas-devel
 ```
 
+## Docker
+
+The repository provides a production-ready Docker image that packages the Qwen3-ASR C binary and a **streaming WebSocket server**. The image is built with a multi-stage Dockerfile: the first stage compiles `qwen_asr` on Debian with OpenBLAS; the second stage produces a minimal runtime image that includes the binary plus a small Python server (FastAPI + WebSockets). **Model weights are not included**; you must mount a model directory (e.g. from `./download_model.sh`) at `/models` when you run the container.
+
+### Building the image
+
+From the repository root:
+
+```bash
+docker build -t qwen-asr .
+```
+
+- **Tag:** `-t qwen-asr` names the image `qwen-asr`; use any tag you like.
+- **Build:** The Dockerfile uses portable CFLAGS (no `-march=native`) so the image runs on any x86_64 or arm64 host. The resulting image contains the `qwen_asr` binary at `/usr/local/bin` and the streaming server under `/app`.
+
+### Running the container
+
+The container has two modes.
+
+**1. Streaming server (default)**  
+The default `CMD` runs the streaming server. **Recommended:** use the **0.6B** model (faster, good quality) and do not set `QWEN_N_THREADS` so the binary uses **all available CPU cores**. Expose port **2020** and mount your model directory at `/models`:
+
+```bash
+docker run --rm -p 2020:2020 -v /path/to/qwen3-asr-0.6b:/models qwen-asr
+```
+
+- `--rm` removes the container when it exits.
+- `-p 2020:2020` maps host port 2020 to container port 2020 (server listens on 2020 inside the container).
+- `-v /path/to/qwen3-asr-0.6b:/models` mounts your model directory so the server can load weights. Use an absolute path or `$(pwd)/qwen3-asr-0.6b` if the model is in the current directory.
+
+Once the server is up, the WebSocket endpoint is `ws://localhost:2020/stream` (or `ws://<host-ip>:2020/stream` from another machine).
+
+**2. CLI only (no server)**  
+To run the `qwen_asr` binary directly (e.g. to transcribe a file without the WebSocket server), override the entrypoint and pass the usual CLI arguments:
+
+```bash
+docker run --rm --entrypoint /usr/local/bin/qwen_asr \
+  -v /path/to/qwen3-asr-0.6b:/models -v /path/to/audio:/data \
+  qwen-asr -d /models -i /data/audio.wav --silent
+```
+
+Here the second volume mounts a directory containing WAV files; the binary reads `/data/audio.wav` and prints the transcript to stdout.
+
+### The streaming server
+
+The server is implemented in Python in `server/stream_server.py` (FastAPI + uvicorn). It runs inside the container by default and does the following:
+
+- **Listens** on `0.0.0.0` and port **2020** (configurable via the `PORT` environment variable).
+- **WebSocket endpoint:** `GET /stream` with `Upgrade: websocket` opens a WebSocket connection. Other HTTP methods (e.g. POST) to `/stream` receive **405 Method Not Allowed** so health checks or mistaken clients do not trigger handshake errors.
+- **Per connection:** For each WebSocket client, the server spawns one `qwen_asr` process with `-d <MODEL_DIR> --stdin --stream` (no `--silent`, so the C binary streams tokens to stdout). Audio received as **binary WebSocket frames** (raw s16le 16 kHz mono) is written to the process stdin. Text read from the process stdout is sent back as **WebSocket text frames**. When the client sends the text message `end` (or closes the connection), the server closes the process stdin and drains the remaining transcript.
+- **Streaming behavior:** The C binary emits tokens incrementally to stdout; the server forwards them to the client as they arrive, so the client can display the transcript in real time as it is generated.
+- **Environment:** `MODEL_DIR` (default `/models`; use the 0.6B model for best streaming speed), `PORT` (default `2020`), optionally `QWEN_ASR` (path to the binary), and optionally `QWEN_N_THREADS` (if unset, the binary uses all available CPU cores).
+
+The server does not bundle model files; if `/models` is missing or empty, it exits at startup with a clear error.
+
+### The streaming client
+
+A sample client is provided in `examples/stream_client.py`. It:
+
+- **Connects** to the WebSocket URL (default `ws://localhost:2020/stream`).
+- **Reads** a WAV file from disk, converts it to **raw s16le 16 kHz mono** (resampling and mixing to mono if needed, using the Python `wave` module and no extra dependencies).
+- **Sends** the audio in binary WebSocket frames (chunk size configurable with `--chunk`), then sends the text message `end` to signal end-of-input.
+- **Prints** every text message received from the server to stdout with `flush=True`, so transcript text appears **incrementally** as the server streams it.
+- **Prints TTFB and RTF to stderr** when done: **TTFB** (time to first byte) is the seconds from end-of-send until the first transcript chunk; **RTF** (real-time factor) is processing time divided by audio duration (RTF &lt; 1 means faster than realtime). Use `--no-stats` to suppress.
+
+**Usage:**
+
+```bash
+pip install websockets
+python examples/stream_client.py --url ws://localhost:2020/stream --audio samples/jfk.wav
+```
+
+Optional arguments: `--url` (WebSocket URL), `--audio` (path to WAV), `--chunk` (bytes per audio frame, default 8192). If you omit `--url`, the default is `ws://localhost:2020/stream`.
+
+### End-to-end streaming flow
+
+1. **Client** opens a WebSocket to `ws://host:2020/stream`.
+2. **Client** sends audio as binary frames (s16le 16 kHz mono) and then `end`.
+3. **Server** starts `qwen_asr -d /models --stdin --stream`, pipes received binary data to the process stdin, and reads stdout.
+4. **C binary** consumes audio from stdin, runs streaming ASR (chunked encoder/decoder with prefix rollback), and writes transcript tokens to stdout as they are produced.
+5. **Server** forwards each chunk of stdout to the client as a WebSocket text message.
+6. **Client** prints each message to stdout immediately, so the user sees the transcript stream in real time.
+
+### Quick test (two terminals)
+
+**Terminal 1 — start the server:**
+
+```bash
+docker run --rm -p 2020:2020 -v $(pwd)/qwen3-asr-0.6b:/models qwen-asr
+```
+
+**Terminal 2 — run the client:**
+
+```bash
+pip install websockets
+python examples/stream_client.py --audio samples/jfk.wav
+```
+
+You should see the transcript for `samples/jfk.wav` appear word-by-word (or in small chunks) as it is generated.
+
+### Running the server without Docker
+
+For development or local runs without Docker, install the server dependencies and run the script directly (the `qwen_asr` binary must be on your PATH, e.g. from `make blas`):
+
+```bash
+pip install -r server/requirements.txt
+MODEL_DIR=./qwen3-asr-0.6b PORT=2020 python3 server/stream_server.py
+```
+
+Then use the client with `--url ws://localhost:2020/stream` as above.
+
+## CPU-only inference and performance
+
+**Does it use the GPU?** No. This C implementation is **CPU-only**. It uses BLAS (OpenBLAS on Linux, Accelerate on macOS) and architecture-specific SIMD (AVX on x86, NEON on ARM). There is no CUDA, MPS, or other GPU backend. The project explicitly targets CPU inference so it runs on generic Linux servers and workstations without a GPU.
+
+**How can I make streaming (and inference) faster?**
+
+1. **Use more CPU threads** — The `qwen_asr` binary uses a thread pool for matmuls and attention. By default it uses all detected CPUs (`-t` auto). You can set the number of threads explicitly when running the CLI (e.g. `-t 8`). The Docker streaming server runs the binary without `-t`, so it already uses the default (all cores). To cap or tune threads in the server, set the `QWEN_N_THREADS` environment variable when running the container (e.g. `docker run -e QWEN_N_THREADS=8 ...`); the server will pass `-t $QWEN_N_THREADS` to the binary. On shared hosts, limiting threads can avoid oversubscription.
+
+2. **Use the 0.6B model** — The 0.6B model is faster than 1.7B with only a small quality tradeoff; use it when speed matters (e.g. mount `qwen3-asr-0.6b` at `/models`).
+
+3. **OpenBLAS** — On Linux, OpenBLAS may use OpenMP or pthreads. You can try setting `OPENBLAS_NUM_THREADS` (or `OMP_NUM_THREADS` if OpenBLAS was built with OpenMP) to match your core count or to avoid oversubscription if you also set `-t`; experiment for your machine.
+
+4. **Build with native CPU tuning (non-Docker)** — The Docker image is built with portable CFLAGS. If you build locally with `make blas`, the Makefile uses `-march=native`, which can be faster on that specific machine. For local development or maximum speed on a fixed host, build and run the binary (and optionally the server) outside Docker.
+
+5. **Streaming vs offline** — Streaming mode (`--stream`) prioritizes incremental, low-latency output and can be slower than offline or segmented mode for a full file. For pre-recorded files where you only need the final transcript, offline (`-S 0`) or segmented (`-S 20` or `-S 30`) is usually faster. Use streaming when you need tokens as they are produced (e.g. live captioning).
+
+**I need GPU acceleration.** Use the official [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) Python toolkit with the vLLM or transformers backend and a CUDA-capable GPU; that stack supports GPU inference and is documented in their repo. This C implementation does not and will not support GPU in the foreseeable future.
+
 ## How Fast Is It?
 
 Benchmarks were recomputed on **Apple M3 Max** (128GB RAM) with `make blas` (single run per row).
