@@ -1,0 +1,25 @@
+# Model dirs (large; mount at runtime)
+qwen3-asr-0.6b/
+qwen3-asr-1.7b/
+Qwen3-ASR/
+
+# Local-only / build artifacts
+.git/
+*.o
+qwen_asr
+
+# Optional / extra (see CLAUDE.md)
+samples/extra/
+TODO.md
+
+# Python venv / IDE
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Misc
+*.md
+!README.md
+.pytest_cache/
+.asv/
