@@ -17,7 +17,7 @@ TARGET = qwen_asr
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas test test-stream-cache
+.PHONY: all clean debug info help blas server test test-stream-cache
 
 # Default: show available targets
 all: help
@@ -27,6 +27,7 @@ help:
 	@echo ""
 	@echo "Choose a backend:"
 	@echo "  make blas     - With BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make server   - Build HTTP inference server (qwen_asr_server)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make debug    - Debug build with AddressSanitizer"
@@ -36,6 +37,7 @@ help:
 	@echo "  make info     - Show build configuration"
 	@echo ""
 	@echo "Example: make blas && ./qwen_asr -d model_dir -i audio.wav"
+	@echo "         make server && ./qwen_asr_server -d model_dir"
 
 # =============================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
@@ -52,6 +54,30 @@ blas:
 	@$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
 	@echo ""
 	@echo "Built with BLAS backend"
+
+# =============================================================================
+# HTTP server (C++17, links against the same BLAS-accelerated C objects)
+# =============================================================================
+SERVER_TARGET = qwen_asr_server
+SERVER_CXX    = g++
+SERVER_CXXFLAGS = -std=c++17 -Wall -Wextra -O3 -march=native -ffast-math \
+                  -I. -Iexamples/server
+
+ifeq ($(UNAME_S),Darwin)
+server: SERVER_CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
+server: SERVER_LDFLAGS = -framework Accelerate -lm -lpthread
+else
+server: SERVER_CFLAGS  = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
+server: SERVER_LDFLAGS = -lopenblas -lm -lpthread
+endif
+server:
+	@$(MAKE) clean
+	@$(MAKE) $(OBJS) CFLAGS="$(SERVER_CFLAGS)"
+	$(SERVER_CXX) $(SERVER_CXXFLAGS) $(SERVER_CFLAGS) \
+	    examples/server/server.cpp $(OBJS) \
+	    $(SERVER_LDFLAGS) -o $(SERVER_TARGET)
+	@echo ""
+	@echo "Built $(SERVER_TARGET)"
 
 # =============================================================================
 # Build rules
@@ -73,7 +99,7 @@ debug:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) main.o $(TARGET)
+	rm -f $(OBJS) main.o $(TARGET) $(SERVER_TARGET)
 
 info:
 	@echo "Platform: $(UNAME_S)"
