@@ -36,6 +36,8 @@ help:
 	@echo "  make info     - Show build configuration"
 	@echo ""
 	@echo "Example: make blas && ./qwen_asr -d model_dir -i audio.wav"
+	@echo ""
+	@echo "See examples/ for additional tools"
 
 # =============================================================================
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
@@ -72,7 +74,7 @@ debug:
 # =============================================================================
 # Utilities
 # =============================================================================
-clean:
+clean::
 	rm -f $(OBJS) main.o $(TARGET)
 
 info:
@@ -102,3 +104,8 @@ qwen_asr_decoder.o: qwen_asr_decoder.c qwen_asr.h qwen_asr_kernels.h qwen_asr_sa
 qwen_asr_tokenizer.o: qwen_asr_tokenizer.c qwen_asr_tokenizer.h
 qwen_asr_safetensors.o: qwen_asr_safetensors.c qwen_asr_safetensors.h
 main.o: main.c qwen_asr.h qwen_asr_kernels.h
+
+# =============================================================================
+# Per-example build rules
+# =============================================================================
+-include $(wildcard examples/*/Makefile.mk)

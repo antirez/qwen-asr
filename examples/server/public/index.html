@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <title>Qwen3-ASR: Real-time transcription</title>
+
+        <style>
+            #output {
+                width: 100%;
+                height: 100%;
+                margin: 0 auto;
+                margin-top: 10px;
+                border-left: 0px;
+                border-right: 0px;
+                padding-left: 0px;
+                padding-right: 0px;
+                display: block;
+                background-color: black;
+                color: white;
+                font-size: 10px;
+                font-family: 'Lucida Console', Monaco, monospace;
+                outline: none;
+                white-space: pre;
+                overflow-wrap: normal;
+                overflow-x: scroll;
+            }
+        </style>
+        <link rel="icon" href="data:,">
+    </head>
+    <body>
+        <div id="main-container">
+            <b>Qwen3-ASR: Real-time transcription via qwen-asr-server</b>
+
+            <br><br>
+
+            Microphone audio is captured in the browser and sent to the native
+            qwen-asr-server for inference. No WASM required, full native CPU performance.
+
+            <br><br>
+
+            <hr>
+
+            Click the "Start" button and start speaking
+
+            <br><br>
+
+            <table>
+                <tr>
+                    <td>
+                        Language:
+                        <select id="language" name="language">
+                            <option value="">Auto-detect</option>
+                            <option value="Arabic">Arabic</option>
+                            <option value="Cantonese">Cantonese</option>
+                            <option value="Chinese">Chinese</option>
+                            <option value="Czech">Czech</option>
+                            <option value="Danish">Danish</option>
+                            <option value="Dutch">Dutch</option>
+                            <option value="English" selected>English</option>
+                            <option value="Filipino">Filipino</option>
+                            <option value="Finnish">Finnish</option>
+                            <option value="French">French</option>
+                            <option value="German">German</option>
+                            <option value="Greek">Greek</option>
+                            <option value="Hindi">Hindi</option>
+                            <option value="Hungarian">Hungarian</option>
+                            <option value="Indonesian">Indonesian</option>
+                            <option value="Italian">Italian</option>
+                            <option value="Japanese">Japanese</option>
+                            <option value="Korean">Korean</option>
+                            <option value="Macedonian">Macedonian</option>
+                            <option value="Malay">Malay</option>
+                            <option value="Persian">Persian</option>
+                            <option value="Polish">Polish</option>
+                            <option value="Portuguese">Portuguese</option>
+                            <option value="Romanian">Romanian</option>
+                            <option value="Russian">Russian</option>
+                            <option value="Spanish">Spanish</option>
+                            <option value="Swedish">Swedish</option>
+                            <option value="Thai">Thai</option>
+                            <option value="Turkish">Turkish</option>
+                            <option value="Vietnamese">Vietnamese</option>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        Server URL:
+                        <input type="text" id="serverUrl" size="40" placeholder="(leave empty for same origin)">
+                    </td>
+                </tr>
+            </table>
+
+            <br>
+
+            <div id="input">
+                <button id="start"  onclick="onStart()">Start</button>
+                <button id="stop"   onclick="onStop()" disabled>Stop</button>
+                <button id="clear"  onclick="onClear()">Clear</button>
+            </div>
+
+            <br>
+
+            <div id="state">
+                Status: <b><span id="state-status">not started</span></b>
+
+                <pre id="state-transcribed">[The transcribed text will be displayed here]</pre>
+            </div>
+
+            <hr>
+
+            Debug output:
+            <textarea id="output" rows="20"></textarea>
+
+            <br>
+
+            <b>Troubleshooting</b>
+
+            <br><br>
+
+            <ul>
+                <li>Use a modern web browser (Chrome, Firefox)</li>
+                <li>Make sure qwen-asr-server is running and the URL above is correct</li>
+                <li>Check the browser console and debug output for errors</li>
+            </ul>
+        </div>
+
+        <script type='text/javascript'>
+            // --- Configuration ---
+            var kChunkInterval_ms = 5000;
+            var kSampleRate = 16000;
+            var kMaxLines = 20;
+
+            // --- State ---
+            var audioContext = null;
+            var sourceNode = null;
+            var processorNode = null;
+            var audioStream = null;
+            var recording = false;
+            var pendingRequests = 0;
+            var audioBuffer = [];
+            var chunkTimer = null;
+
+            var nLines = 0;
+            var transcribedAll = '';
+
+            function printTextarea(msg) {
+                var textarea = document.getElementById('output');
+                textarea.value += msg + '\n';
+                textarea.scrollTop = textarea.scrollHeight;
+            }
+
+            function getServerUrl() {
+                var el = document.getElementById('serverUrl');
+                return el.value.replace(/\/+$/, '') || window.location.origin;
+            }
+
+            // --- WAV encoding ---
+            function encodeWAV(samples, sampleRate) {
+                var numSamples = samples.length;
+                var buffer = new ArrayBuffer(44 + numSamples * 2);
+                var view = new DataView(buffer);
+
+                // RIFF header
+                writeString(view, 0, 'RIFF');
+                view.setUint32(4, 36 + numSamples * 2, true);
+                writeString(view, 8, 'WAVE');
+
+                // fmt chunk
+                writeString(view, 12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, 1, true);
+                view.setUint16(22, 1, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * 2, true);
+                view.setUint16(32, 2, true);
+                view.setUint16(34, 16, true);
+
+                // data chunk
+                writeString(view, 36, 'data');
+                view.setUint32(40, numSamples * 2, true);
+
+                var offset = 44;
+                for (var i = 0; i < numSamples; i++, offset += 2) {
+                    var s = Math.max(-1, Math.min(1, samples[i]));
+                    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                }
+
+                return new Blob([buffer], { type: 'audio/wav' });
+            }
+
+            function writeString(view, offset, string) {
+                for (var i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            // --- Downsample from native rate to target rate ---
+            function downsample(samples, fromRate, toRate) {
+                if (fromRate === toRate) return samples;
+                var ratio = fromRate / toRate;
+                var newLen = Math.round(samples.length / ratio);
+                var result = new Float32Array(newLen);
+                for (var i = 0; i < newLen; i++) {
+                    var srcIdx = i * ratio;
+                    var idx = Math.floor(srcIdx);
+                    var frac = srcIdx - idx;
+                    result[i] = (idx + 1 < samples.length)
+                        ? samples[idx] * (1 - frac) + samples[idx + 1] * frac
+                        : samples[idx];
+                }
+                return result;
+            }
+
+            // --- Flush accumulated audio buffer as a WAV chunk ---
+            function flushAudioBuffer() {
+                if (audioBuffer.length === 0) return;
+
+                var totalLen = 0;
+                for (var i = 0; i < audioBuffer.length; i++) totalLen += audioBuffer[i].length;
+                var raw = new Float32Array(totalLen);
+                var offset = 0;
+                for (var i = 0; i < audioBuffer.length; i++) {
+                    raw.set(audioBuffer[i], offset);
+                    offset += audioBuffer[i].length;
+                }
+                audioBuffer = [];
+
+                var nativeRate = audioContext ? audioContext.sampleRate : kSampleRate;
+                var pcm = downsample(raw, nativeRate, kSampleRate);
+
+                var wavBlob = encodeWAV(pcm, kSampleRate);
+                sendChunk(wavBlob);
+            }
+
+            // --- Send chunk to server ---
+            function sendChunk(wavBlob) {
+                var lang = document.getElementById('language').value;
+                var form = new FormData();
+                form.append('file', wavBlob, 'chunk.wav');
+                form.append('response_format', 'json');
+                if (lang) {
+                    form.append('language', lang);
+                }
+
+                pendingRequests++;
+                updateStatus();
+
+                printTextarea('js: sending audio chunk (' + Math.round(wavBlob.size / 1024) + ' KB)');
+
+                fetch(getServerUrl() + '/inference', {
+                    method: 'POST',
+                    body: form,
+                })
+                .then(function(resp) {
+                    if (!resp.ok) {
+                        return resp.text().then(function(t) {
+                            throw new Error('server error ' + resp.status + ': ' + t);
+                        });
+                    }
+                    return resp.json();
+                })
+                .then(function(data) {
+                    var text = (data.text || '').trim();
+                    var timing = '';
+                    if (data.total_ms !== undefined) {
+                        timing = ' [total=' + data.total_ms.toFixed(0) + 'ms'
+                               + ' enc=' + data.encode_ms.toFixed(0) + 'ms'
+                               + ' dec=' + data.decode_ms.toFixed(0) + 'ms'
+                               + ' ' + data.tok_s.toFixed(1) + ' tok/s'
+                               + ' ' + data.rt_factor.toFixed(2) + 'x RT]';
+                    }
+                    printTextarea('js: received text: "' + text + '"' + timing);
+                    if (text) {
+                        transcribedAll += text + '<br>';
+                        nLines++;
+
+                        if (nLines > kMaxLines) {
+                            var i = transcribedAll.indexOf('<br>');
+                            if (i > 0) {
+                                transcribedAll = transcribedAll.substring(i + 4);
+                                nLines--;
+                            }
+                        }
+
+                        document.getElementById('state-transcribed').innerHTML = transcribedAll;
+                    }
+                })
+                .catch(function(err) {
+                    printTextarea('js: request failed: ' + err.message);
+                })
+                .then(function() {
+                    pendingRequests--;
+                    updateStatus();
+                });
+            }
+
+            function updateStatus() {
+                var el = document.getElementById('state-status');
+                if (!recording && pendingRequests === 0) {
+                    el.innerHTML = 'not started';
+                } else if (recording && pendingRequests > 0) {
+                    el.innerHTML = 'recording | processing ' + pendingRequests + ' chunk(s)';
+                } else if (recording) {
+                    el.innerHTML = 'recording';
+                } else {
+                    el.innerHTML = 'processing remaining ' + pendingRequests + ' chunk(s)';
+                }
+            }
+
+            // --- Recording via Web Audio API ---
+
+            window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+            function onStart() {
+                if (recording) return;
+
+                printTextarea('js: requesting microphone access...');
+
+                navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+                    .then(function(stream) {
+                        audioStream = stream;
+                        recording = true;
+
+                        document.getElementById('start').disabled = true;
+                        document.getElementById('stop').disabled = false;
+
+                        audioBuffer = [];
+
+                        audioContext = new AudioContext();
+                        sourceNode = audioContext.createMediaStreamSource(audioStream);
+
+                        processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+                        processorNode.onaudioprocess = function(e) {
+                            if (!recording) return;
+                            var input = e.inputBuffer.getChannelData(0);
+                            audioBuffer.push(new Float32Array(input));
+                        };
+
+                        sourceNode.connect(processorNode);
+                        processorNode.connect(audioContext.destination);
+
+                        chunkTimer = setInterval(flushAudioBuffer, kChunkInterval_ms);
+
+                        printTextarea('js: recording started, sample rate: ' + audioContext.sampleRate);
+                        updateStatus();
+                    })
+                    .catch(function(err) {
+                        printTextarea('js: error getting audio stream: ' + err);
+                    });
+            }
+
+            function onStop() {
+                if (!recording) return;
+
+                recording = false;
+
+                document.getElementById('start').disabled = false;
+                document.getElementById('stop').disabled = true;
+
+                if (chunkTimer) {
+                    clearInterval(chunkTimer);
+                    chunkTimer = null;
+                }
+
+                flushAudioBuffer();
+
+                if (processorNode) {
+                    processorNode.disconnect();
+                    processorNode = null;
+                }
+                if (sourceNode) {
+                    sourceNode.disconnect();
+                    sourceNode = null;
+                }
+                if (audioContext) {
+                    audioContext.close();
+                    audioContext = null;
+                }
+                if (audioStream) {
+                    audioStream.getTracks().forEach(function(t) { t.stop(); });
+                    audioStream = null;
+                }
+
+                printTextarea('js: recording stopped');
+                updateStatus();
+            }
+
+            function onClear() {
+                nLines = 0;
+                transcribedAll = '';
+                document.getElementById('state-transcribed').innerHTML = '[The transcribed text will be displayed here]';
+            }
+        </script>
+    </body>
+</html>

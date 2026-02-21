@@ -1,5 +1,6 @@
 *.o
 qwen_asr
+qwen_asr_server
 venv/
 venv312/
 qwen3-asr-0.6b/
