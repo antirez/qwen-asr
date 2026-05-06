@@ -1317,6 +1317,14 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     #define QWEN_STREAM_STALE_CHUNKS 4
     #define QWEN_STREAM_RESET_INTERVAL_CHUNKS 45
     #define QWEN_STREAM_RESET_CARRY_TOKENS 24
+    /* Stream-mode silence skip: chunks whose RMS sits below an adaptive
+     * threshold (P25 of recent chunk RMS × ratio) are skipped past the
+     * encoder/decoder/emit work. Mirrors compact_silence's offline gating. */
+    #define QWEN_STREAM_SILENCE_BASE_RMS 0.002f
+    #define QWEN_STREAM_SILENCE_MAX_RMS 0.025f
+    #define QWEN_STREAM_SILENCE_RATIO 1.8f
+    #define QWEN_STREAM_RMS_HIST_LEN 16
+    #define QWEN_STREAM_MAX_SILENCE_SKIPS 60
 
     if (qwen_verbose >= 2) {
         if (live)
@@ -1429,6 +1437,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int prev_prefill_cap = 0;
     int prefill_total_tokens = 0;
     int prefill_reused_tokens = 0;
+    float rms_hist[QWEN_STREAM_RMS_HIST_LEN];
+    int rms_hist_pos = 0;
+    int rms_hist_count = 0;
+    int consecutive_silence_skips = 0;
 
     while (audio_cursor < audio_n_samples || (live && !live_eof)) {
         /* Live mode: wait until we have enough data for the next chunk. */
@@ -1502,6 +1514,71 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         if (audio_cursor > audio_n_samples) audio_cursor = audio_n_samples;
         int is_final = live ? (live_eof && audio_cursor >= audio_n_samples)
                             : (audio_cursor >= audio_n_samples);
+
+        /* Stream-mode silence skip: when --skip-silence is on, drop the
+         * encoder/decoder/emit work for chunks whose RMS sits below an
+         * adaptive threshold computed from recent chunk RMS values
+         * (P25 × ratio, mirrors compact_silence). Samples remain in the
+         * local buffer so future complete encoder windows still see them
+         * intact -- only the per-chunk emit cycle is short-circuited.
+         * Capped at QWEN_STREAM_MAX_SILENCE_SKIPS in a row so any pending
+         * decoder/text state still gets flushed during very long pauses. */
+        if (ctx->skip_silence && !is_final && live) {
+            int64_t chunk_start = audio_cursor - chunk_samples;
+            if (chunk_start < 0) chunk_start = 0;
+            int64_t chunk_local_off = chunk_start - local_base_sample;
+            int64_t chunk_len = audio_cursor - chunk_start;
+
+            if (chunk_local_off >= 0 &&
+                chunk_local_off + chunk_len <= local_n_samples &&
+                chunk_len > 0) {
+                float energy = 0.0f;
+                for (int64_t i = 0; i < chunk_len; i++) {
+                    float v = audio_samples[chunk_local_off + i];
+                    energy += v * v;
+                }
+                float chunk_rms = sqrtf(energy / (float)chunk_len);
+
+                rms_hist[rms_hist_pos] = chunk_rms;
+                rms_hist_pos = (rms_hist_pos + 1) % QWEN_STREAM_RMS_HIST_LEN;
+                if (rms_hist_count < QWEN_STREAM_RMS_HIST_LEN) rms_hist_count++;
+
+                float threshold;
+                if (rms_hist_count < 4) {
+                    threshold = QWEN_STREAM_SILENCE_BASE_RMS;
+                } else {
+                    float sorted[QWEN_STREAM_RMS_HIST_LEN];
+                    memcpy(sorted, rms_hist,
+                           (size_t)rms_hist_count * sizeof(float));
+                    qsort(sorted, (size_t)rms_hist_count, sizeof(float),
+                          cmp_float_asc);
+                    float p25 = sorted[rms_hist_count / 4];
+                    threshold = p25 * QWEN_STREAM_SILENCE_RATIO;
+                    if (threshold < QWEN_STREAM_SILENCE_BASE_RMS) {
+                        threshold = QWEN_STREAM_SILENCE_BASE_RMS;
+                    }
+                    if (threshold > QWEN_STREAM_SILENCE_MAX_RMS) {
+                        threshold = QWEN_STREAM_SILENCE_MAX_RMS;
+                    }
+                }
+
+                if (chunk_rms < threshold &&
+                    consecutive_silence_skips < QWEN_STREAM_MAX_SILENCE_SKIPS) {
+                    consecutive_silence_skips++;
+                    if (qwen_verbose >= 2) {
+                        fprintf(stderr,
+                                "  Silence skip: rms=%.5f thresh=%.5f "
+                                "(chunk %d, run=%d)\n",
+                                chunk_rms, threshold, chunk_idx,
+                                consecutive_silence_skips);
+                    }
+                    ctx->perf_total_ms += get_time_ms() - chunk_t0;
+                    chunk_idx++;
+                    continue;
+                }
+                consecutive_silence_skips = 0;
+            }
+        }
 
         /* Encoder path:
          * - default: cache completed local-attention windows and re-encode only

@@ -61,7 +61,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)\n");
     fprintf(stderr, "  --past-text <yes|no|auto>  Reuse previously decoded text as context for the next\n");
     fprintf(stderr, "                             segment/chunk (continuity bias; auto=yes for --stream)\n");
-    fprintf(stderr, "  --skip-silence              Drop long silent spans before inference (off by default)\n");
+    fprintf(stderr, "  --skip-silence              Drop silent spans (offline) / skip silent chunks (stream); off by default\n");
     fprintf(stderr, "  --prompt <text>            System prompt for biasing (example: \"Preserve spelling: CPU, CUDA, PostgreSQL, Redis\")\n");
     fprintf(stderr, "  --language <lang>          Force output language via token conditioning\n");
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
