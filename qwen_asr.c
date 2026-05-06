@@ -1312,7 +1312,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     #define QWEN_STREAM_MAX_REPEAT_TOKEN_RUN 12
     #define QWEN_STREAM_OVERLAP_MAX_TOKENS 48
     #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
-    #define QWEN_STREAM_DEGEN_MAX_PERIOD 6
+    #define QWEN_STREAM_DEGEN_MAX_PERIOD 32
     #define QWEN_STREAM_DEGEN_MIN_REPEATS 4
     #define QWEN_STREAM_STALE_CHUNKS 4
     #define QWEN_STREAM_RESET_INTERVAL_CHUNKS 45
