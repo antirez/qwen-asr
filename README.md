@@ -113,7 +113,7 @@ These limits activate automatically when the stream is long enough to exceed the
 `--stream --silent` has a special non-interactive behavior for file input: it skips chunk-by-chunk streaming and runs one direct final refinement pass. (For live stdin streaming, chunked mode is still used.)
 
 Default stream settings:
-- `chunk_size`: 2s
+- `chunk_size`: 2s (`--stream-chunk-sec`, range `1..8`)
 - `encoder_window`: 8s (`--enc-window-sec`, range `1..8`)
 - `rollback`: 5 tokens
 - `unfixed_chunks`: 2
@@ -126,12 +126,29 @@ Streaming tuning:
 # default streaming
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream
 
-# lower-latency encoder window (may reduce quality)
+# larger chunk for 1.7B / slower hardware (see notes below)
+./qwen_asr -d qwen3-asr-1.7b -i audio.wav --stream --stream-chunk-sec 4
+
+# narrower encoder window (less compute per chunk; may reduce quality)
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream --enc-window-sec 4
 
 # allow more text generation per chunk
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream --stream-max-new-tokens 64
 ```
+
+Picking `--stream-chunk-sec`:
+
+The default 2s matches the official Qwen3-ASR vLLM streaming example. On
+**Apple M1 Pro**, 0.6B processes ~0.8s per chunk so 2s has plenty of headroom.
+1.7B takes ~1.5-2s, right at the 2s budget, and a real-time stream backlogs
+over time. Raising 1.7B to `chunk_sec=4` adds 2s to per-chunk delay but
+eliminates the backlog — net on-screen latency **drops** by several seconds.
+
+If realtime ratio approaches 1x, raise `--stream-chunk-sec` rather than lower
+`--enc-window-sec`: `chunk_sec` is a pure scheduling knob with no quality cost,
+while a smaller encoder window also reduces the model's per-token attention
+context. Past the headroom point further increases just add latency, since
+each chunk's audio must arrive before its tokens emit.
 
 ### Monitor Mode (`--monitor`)
 
