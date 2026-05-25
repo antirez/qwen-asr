@@ -58,6 +58,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)\n");
     fprintf(stderr, "  --stream      Streaming mode: process in chunks with prefix rollback\n");
     fprintf(stderr, "  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)\n");
+    fprintf(stderr, "  --stream-chunk-sec <secs>  Streaming chunk size in seconds (1..8, default 2)\n");
+    fprintf(stderr, "                             Raise on larger models / slower hardware if per-chunk\n");
+    fprintf(stderr, "                             processing > chunk_sec (display latency grows over time)\n");
     fprintf(stderr, "  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)\n");
     fprintf(stderr, "  --past-text <yes|no|auto>  Reuse previously decoded text as context for the next\n");
     fprintf(stderr, "                             segment/chunk (continuity bias; auto=yes for --stream)\n");
@@ -82,6 +85,7 @@ int main(int argc, char **argv) {
     float search_sec = -1;  /* -1 = use default (3) */
     int stream_mode = 0;
     int stream_max_new_tokens = -1; /* -1 = use default (32) */
+    float stream_chunk_sec = -1; /* -1 = use default (2s) */
     float enc_window_sec = -1;   /* -1 = use default (8s) */
     const char *prompt_text = NULL;
     const char *force_language = NULL;
@@ -104,6 +108,8 @@ int main(int argc, char **argv) {
             stream_mode = 1;
         } else if (strcmp(argv[i], "--stream-max-new-tokens") == 0 && i + 1 < argc) {
             stream_max_new_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--stream-chunk-sec") == 0 && i + 1 < argc) {
+            stream_chunk_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--enc-window-sec") == 0 && i + 1 < argc) {
             enc_window_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--past-text") == 0 && i + 1 < argc) {
@@ -147,6 +153,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: --enc-window-sec must be in [1, 8], got %.3f\n", enc_window_sec);
         return 1;
     }
+    if (stream_chunk_sec >= 0 && (stream_chunk_sec < 1.0f || stream_chunk_sec > 8.0f)) {
+        fprintf(stderr, "Error: --stream-chunk-sec must be in [1, 8], got %.3f\n", stream_chunk_sec);
+        return 1;
+    }
     if (stream_max_new_tokens == 0 || stream_max_new_tokens < -1) {
         fprintf(stderr, "Error: --stream-max-new-tokens must be > 0\n");
         return 1;
@@ -180,6 +190,7 @@ int main(int argc, char **argv) {
         ctx->config.enc_n_window_infer = window_frames;
     }
     if (stream_max_new_tokens > 0) ctx->stream_max_new_tokens = stream_max_new_tokens;
+    if (stream_chunk_sec >= 0) ctx->stream_chunk_sec = stream_chunk_sec;
     if (past_text_conditioning_mode >= 0)
         ctx->past_text_conditioning = past_text_conditioning_mode;
     else if (stream_mode)
