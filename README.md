@@ -50,6 +50,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Stdin input**: Reads from stdin with auto-detection (WAV header or raw s16le 16kHz mono).
 - **Optional segment splitting**: use `-S 20` / `-S 30` for large files with segment-cutting silence search (`-W 3`).
+- **Timeline output**: `--timeline-file` writes approximate cue timestamps as SRT/VTT/JSONL/plain text (offline modes).
 
 ## Usage
 
@@ -157,6 +158,58 @@ Example output (stderr + stdout interleaved):
 ```
 
 Monitor output goes to stderr and does not affect the transcription text on stdout. It can be combined with `--debug` for full diagnostics, or used alone for a lightweight visual heartbeat.
+
+### Timeline / Timestamps (`--timeline-file`)
+
+```bash
+# SRT subtitles (format inferred from the .srt extension)
+./qwen_asr -d qwen3-asr-0.6b -i recording.wav --timeline-file out.srt
+
+# Explicit format override; "-" writes the timeline to stdout
+./qwen_asr -d qwen3-asr-0.6b -i recording.wav --timeline-file out.jsonl
+./qwen_asr -d qwen3-asr-0.6b -i recording.wav --timeline-file - --timeline-format txt
+```
+
+Writes timed text cues for offline transcription (`-i` and `--stdin`; not `--stream`). Four formats are supported, inferred from the output extension (`srt`, `vtt`, `jsonl`, `txt`; default `srt`) and overridable with `--timeline-format`. The transcription itself is unchanged: full text still goes to stdout, the timeline is written at the end.
+
+How the times are produced:
+
+- **Segment boundaries are exact.** With `-S > 0`, cues never cross a segment cut, and segment cuts come from the silence search at known audio offsets.
+- **Within a segment, times are estimated.** Text is split at sentence punctuation (then clause punctuation when a cue would exceed `--timeline-max-cue-sec`, default 7), and the pieces are distributed proportionally over the segment's speech-active windows (energy-based voice detection), with boundaries snapped to nearby silences. Expect roughly ±1–2 s accuracy inside a segment — good enough for subtitles, not word-accurate alignment.
+
+Notes:
+
+- If `-S` is not given, `--timeline-file` enables `-S 20` automatically (a notice is printed to stderr) because timeline granularity comes from segment boundaries. `-S 0` is allowed and still produces intra-segment cues.
+- Not compatible with `--skip-silence` (silence compaction destroys absolute time) — the CLI rejects the combination.
+- `--timeline-max-cue-sec <s>` bounds the estimated cue length (default 7).
+
+Example SRT output:
+
+```text
+1
+00:00:00,000 --> 00:00:03,450
+如何把广东省鞋拍成买不起的样子？
+
+2
+00:00:03,450 --> 00:00:09,180
+首先，拍一个你这辈子都不会穿拖鞋去的地方。
+```
+
+C API:
+
+```c
+qwen_set_timeline(ctx, 1);              /* collect cues during transcription */
+qwen_transcribe(ctx, "audio.wav");      /* or any offline transcribe call */
+
+const qwen_timeline_entry_t *entries;
+int n = qwen_get_timeline(ctx, &entries);
+for (int i = 0; i < n; i++) {
+    printf("[%.2f - %.2f] %s\n", entries[i].start_sec, entries[i].end_sec, entries[i].text);
+}
+qwen_timeline_reset(ctx);               /* optional: clear; also freed by qwen_free() */
+```
+
+Entries accumulate across transcribe calls until `qwen_timeline_reset()`.
 
 ### Segment Splitting (`-S`)
 

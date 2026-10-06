@@ -21,10 +21,14 @@ The harness always prints two distances per sample:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -287,6 +291,181 @@ def run_segment_conditioning_regression(
         f"{C_GREEN}ratio={ratio:.3f}{C_RESET}"
     )
     return 0
+
+
+TIMELINE_FORMATS = ("srt", "vtt", "jsonl", "txt")
+
+
+def _wav_duration_s(wav: Path) -> float:
+    with wave.open(str(wav), "rb") as w:
+        return w.getnframes() / float(w.getframerate() or 1)
+
+
+def _parse_timeline(path: Path, fmt: str) -> List[Tuple[float, float, str]]:
+    """Parse a timeline file into (start, end, text) tuples."""
+    entries: List[Tuple[float, float, str]] = []
+    text = path.read_text(encoding="utf-8")
+    if fmt == "jsonl":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            entries.append((float(obj["start"]), float(obj["end"]), str(obj["text"])))
+    elif fmt == "txt":
+        pat = re.compile(
+            r"^\[(\d{2}):(\d{2}):(\d{2}\.\d{3}) - (\d{2}):(\d{2}):(\d{2}\.\d{3})\] (.*)$"
+        )
+        for line in text.splitlines():
+            m = pat.match(line.strip())
+            if not m:
+                continue
+            h1, m1, s1, h2, m2, s2, body = m.groups()
+            a = int(h1) * 3600 + int(m1) * 60 + float(s1)
+            b = int(h2) * 3600 + int(m2) * 60 + float(s2)
+            entries.append((a, b, body))
+    else:  # srt / vtt blocks
+        pat = re.compile(
+            r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})"
+        )
+        for block in re.split(r"\n\s*\n", text.strip()):
+            lines = [l for l in block.strip().splitlines() if l.strip()]
+            idx = next((i for i, l in enumerate(lines) if pat.search(l)), None)
+            if idx is None:
+                continue
+            m = pat.search(lines[idx])
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = m.groups()
+            a = int(h1) * 3600 + int(m1) * 60 + int(s1) + int(ms1) / 1000.0
+            b = int(h2) * 3600 + int(m2) * 60 + int(s2) + int(ms2) / 1000.0
+            body = " ".join(lines[idx + 1:]).strip()
+            entries.append((a, b, body))
+    return entries
+
+
+def _timeline_sanity_errors(entries: List[Tuple[float, float, str]], dur_s: float) -> List[str]:
+    """Basic structural invariants every timeline file must satisfy."""
+    errors: List[str] = []
+    if not entries:
+        return ["no entries parsed"]
+    prev_end = -1.0
+    for i, (a, b, body) in enumerate(entries):
+        if b < a:
+            errors.append(f"entry {i + 1}: end {b:.3f} < start {a:.3f}")
+        if a < -0.01:
+            errors.append(f"entry {i + 1}: start {a:.3f} < 0")
+        if b > dur_s + 0.2:
+            errors.append(f"entry {i + 1}: end {b:.3f} > duration {dur_s:.3f} + 0.2")
+        if a < prev_end - 0.02:
+            errors.append(f"entry {i + 1}: start {a:.3f} before previous end {prev_end:.3f}")
+        if not body.strip():
+            errors.append(f"entry {i + 1}: empty text")
+        prev_end = max(prev_end, b)
+    if entries[-1][1] < dur_s - 5.0:
+        errors.append(
+            f"last entry ends at {entries[-1][1]:.3f}, expected >= duration - 5s ({dur_s - 5.0:.3f})"
+        )
+    return errors
+
+
+def run_timeline_regression(
+    samples_root: Path,
+    binary: Path,
+    model_dir: Path,
+    timeout_s: int,
+    extra_args: Sequence[str],
+    show_output: bool = False,
+) -> int:
+    long_target = samples_root / "night_of_the_living_dead_1968" / "45s_dont_be_afraid_of_me.wav"
+    short_target = samples_root / "jfk.wav"
+
+    if any(a in ("--timeline-file", "--timeline-format", "--stream", "--stdin",
+                 "-S", "--skip-silence") for a in extra_args):
+        print(f"{C_BYELLOW}[SKIP tl-check]{C_RESET} explicit segmentation/stream/timeline args provided")
+        return 0
+
+    failures = 0
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+
+        # Multi-segment SRT: structural sanity + text consistency with stdout.
+        if long_target.exists():
+            out_srt = tmp / "multi.srt"
+            cmd = [str(binary), "-d", str(model_dir), "-i", str(long_target), "--silent",
+                   "-S", "20", "--timeline-file", str(out_srt)] + list(extra_args)
+            print(f"{C_BCYAN}[....  tl-check]{C_RESET} multi-segment SRT on {long_target.name}...", flush=True)
+            t0 = time.monotonic()
+            rc, out, err = run_once(cmd, timeout_s, show_output=show_output)
+            if rc != 0:
+                print(f"{C_BRED}[FAIL tl-check]{C_RESET} transcription failed: {err or rc}")
+                failures += 1
+            else:
+                entries = _parse_timeline(out_srt, "srt")
+                errors = _timeline_sanity_errors(entries, _wav_duration_s(long_target))
+                # Cue texts must reassemble (normalized) into the transcript.
+                if not errors and out:
+                    cue_text = normalize_text(" ".join(e[2] for e in entries))
+                    ref_text = normalize_text(out)
+                    denom = max(1, len(ref_text))
+                    rate = levenshtein(cue_text, ref_text) / denom
+                    if rate > 0.05:
+                        errors.append(
+                            f"cue text mismatch (norm rate {rate:.3f}): cues='{cue_text[:80]}...' stdout='{ref_text[:80]}...'"
+                        )
+                if errors:
+                    failures += 1
+                    for e in errors:
+                        print(f"{C_BRED}[FAIL tl-check]{C_RESET} {e}")
+                else:
+                    print(
+                        f"{C_BGREEN}[ OK  tl-check]{C_RESET} {C_BWHITE}{long_target.name}{C_RESET} | "
+                        f"{len(entries)} cues, monotonic, in-range, text matches stdout | "
+                        f"{fmt_time(time.monotonic() - t0)}"
+                    )
+        else:
+            print(f"{C_BYELLOW}[SKIP tl-check]{C_RESET} missing sample: {long_target}")
+
+        # Format sweep on the short sample (format inferred from extension).
+        if short_target.exists():
+            dur = _wav_duration_s(short_target)
+            for fmt in TIMELINE_FORMATS:
+                out_f = tmp / f"jfk.{fmt}"
+                cmd = [str(binary), "-d", str(model_dir), "-i", str(short_target), "--silent",
+                       "--timeline-file", str(out_f)] + list(extra_args)
+                rc, out, err = run_once(cmd, timeout_s, show_output=show_output)
+                if rc != 0:
+                    print(f"{C_BRED}[FAIL tl-check]{C_RESET} {fmt}: transcription failed: {err or rc}")
+                    failures += 1
+                    continue
+                entries = _parse_timeline(out_f, fmt)
+                errors = _timeline_sanity_errors(entries, dur)
+                if errors:
+                    failures += 1
+                    for e in errors:
+                        print(f"{C_BRED}[FAIL tl-check]{C_RESET} {fmt}: {e}")
+                else:
+                    print(f"{C_BGREEN}[ OK  tl-check]{C_RESET} {fmt}: {len(entries)} cue(s) parsed and sane")
+
+            # Explicit format override on an extensionless path.
+            out_x = tmp / "jfk.out"
+            cmd = [str(binary), "-d", str(model_dir), "-i", str(short_target), "--silent",
+                   "--timeline-file", str(out_x), "--timeline-format", "jsonl"] + list(extra_args)
+            rc, out, err = run_once(cmd, timeout_s, show_output=show_output)
+            if rc != 0:
+                print(f"{C_BRED}[FAIL tl-check]{C_RESET} format override: transcription failed: {err or rc}")
+                failures += 1
+            else:
+                entries = _parse_timeline(out_x, "jsonl")
+                errors = _timeline_sanity_errors(entries, dur)
+                if errors:
+                    failures += 1
+                    for e in errors:
+                        print(f"{C_BRED}[FAIL tl-check]{C_RESET} format override: {e}")
+                else:
+                    print(f"{C_BGREEN}[ OK  tl-check]{C_RESET} format override jsonl: {len(entries)} cue(s) parsed")
+        else:
+            print(f"{C_BYELLOW}[SKIP tl-check]{C_RESET} missing sample: {short_target}")
+
+    return failures
 
 
 def transcribe_stream_stdin(
@@ -724,6 +903,16 @@ def parse_args() -> argparse.Namespace:
         help="Skip stream cache on/off equivalence regression check",
     )
     ap.add_argument(
+        "--timeline-check-only",
+        action="store_true",
+        help="Run only timeline (cue timestamps) regression check",
+    )
+    ap.add_argument(
+        "--skip-timeline-check",
+        action="store_true",
+        help="Skip timeline (cue timestamps) regression check",
+    )
+    ap.add_argument(
         "--stream-cache-model-dir",
         default=STREAM_CACHE_DEFAULT_MODEL_DIR,
         help=f"Model directory used for stream cache check (default: {STREAM_CACHE_DEFAULT_MODEL_DIR})",
@@ -789,10 +978,12 @@ def main() -> int:
     )
 
     focused_count = sum(
-        1 for f in (args.segment_check_only, args.stream_check_only, args.stream_cache_check_only) if f
+        1 for f in (args.segment_check_only, args.stream_check_only,
+                    args.stream_cache_check_only, args.timeline_check_only) if f
     )
     if focused_count > 1:
-        print("--segment-check-only, --stream-check-only and --stream-cache-check-only are mutually exclusive",
+        print("--segment-check-only, --stream-check-only, --stream-cache-check-only and "
+              "--timeline-check-only are mutually exclusive",
               file=sys.stderr)
         return 2
 
@@ -805,23 +996,35 @@ def main() -> int:
     if args.stream_cache_check_only and (args.generate_missing or args.refresh_refs):
         print("--stream-cache-check-only cannot be combined with reference generation", file=sys.stderr)
         return 2
+    if args.timeline_check_only and (args.generate_missing or args.refresh_refs):
+        print("--timeline-check-only cannot be combined with reference generation", file=sys.stderr)
+        return 2
 
     show_output = True
 
     should_generate = args.generate_missing or args.refresh_refs
-    any_focused_only = args.segment_check_only or args.stream_check_only or args.stream_cache_check_only
+    any_focused_only = (args.segment_check_only or args.stream_check_only or
+                        args.stream_cache_check_only or args.timeline_check_only)
 
     run_segment = (not args.skip_segment_check and
                    not args.stream_check_only and
-                   not args.stream_cache_check_only)
+                   not args.stream_cache_check_only and
+                   not args.timeline_check_only)
     run_stream = (not args.skip_stream_check and
                   not args.segment_check_only and
-                  not args.stream_cache_check_only)
+                  not args.stream_cache_check_only and
+                  not args.timeline_check_only)
     run_stream_cache = (not args.skip_stream_cache_check and
                         not args.segment_check_only and
-                        not args.stream_check_only)
+                        not args.stream_check_only and
+                        not args.timeline_check_only)
+    run_timeline = (not args.skip_timeline_check and
+                    not args.segment_check_only and
+                    not args.stream_check_only and
+                    not args.stream_cache_check_only)
 
-    need_primary_model = should_generate or run_segment or run_stream or (not any_focused_only)
+    need_primary_model = (should_generate or run_segment or run_stream or
+                          run_timeline or (not any_focused_only))
     model_dir = Path(args.model_dir).resolve()
     if need_primary_model and not model_dir.exists():
         print(f"missing model dir: {model_dir}", file=sys.stderr)
@@ -877,6 +1080,16 @@ def main() -> int:
             enc_window_sec=args.stream_cache_enc_window_sec,
             threads=args.stream_cache_threads,
             sample_args=args.stream_cache_sample,
+        )
+
+    if run_timeline:
+        failures += run_timeline_regression(
+            samples_root=samples_root,
+            binary=binary,
+            model_dir=model_dir,
+            timeout_s=args.timeout_s,
+            extra_args=args.arg,
+            show_output=show_output,
         )
 
     if any_focused_only:

@@ -11,12 +11,100 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* Token streaming callback: print each piece as it's decoded */
 static void stream_token(const char *piece, void *userdata) {
     (void)userdata;
     fputs(piece, stdout);
     fflush(stdout);
+}
+
+/* ========================================================================
+ * Timeline output (SRT / WebVTT / JSONL / plain text)
+ * ======================================================================== */
+
+enum {
+    TIMELINE_FMT_SRT = 0,
+    TIMELINE_FMT_VTT,
+    TIMELINE_FMT_JSONL,
+    TIMELINE_FMT_TXT
+};
+
+static int parse_timeline_format(const char *s) {
+    if (strcmp(s, "srt") == 0) return TIMELINE_FMT_SRT;
+    if (strcmp(s, "vtt") == 0) return TIMELINE_FMT_VTT;
+    if (strcmp(s, "jsonl") == 0) return TIMELINE_FMT_JSONL;
+    if (strcmp(s, "txt") == 0) return TIMELINE_FMT_TXT;
+    return -1;
+}
+
+/* Infer the output format from a filename extension (default SRT). */
+static int infer_timeline_format(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot || dot == path) return TIMELINE_FMT_SRT;
+    if (strcasecmp(dot, ".vtt") == 0) return TIMELINE_FMT_VTT;
+    if (strcasecmp(dot, ".jsonl") == 0 || strcasecmp(dot, ".json") == 0)
+        return TIMELINE_FMT_JSONL;
+    if (strcasecmp(dot, ".txt") == 0) return TIMELINE_FMT_TXT;
+    return TIMELINE_FMT_SRT;
+}
+
+/* Format seconds as HH:MM:SS,mmm (SRT, comma separator) or HH:MM:SS.mmm. */
+static void timeline_fmt_time(char *buf, size_t n, float t, int comma_ms) {
+    if (t < 0.0f) t = 0.0f;
+    long ms = (long)(t * 1000.0f + 0.5f);
+    int h = (int)(ms / 3600000L);
+    int m = (int)((ms / 60000L) % 60L);
+    int s = (int)((ms / 1000L) % 60L);
+    ms %= 1000L;
+    snprintf(buf, n, "%02d:%02d:%02d%c%03ld", h, m, s, comma_ms ? ',' : '.', ms);
+}
+
+/* Write a JSON string body (no surrounding quotes) with minimal escaping. */
+static void timeline_json_escape(FILE *f, const char *s) {
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"': fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default: fputc(c, f); break;
+        }
+    }
+}
+
+static int write_timeline_file(const char *path, int fmt,
+                               const qwen_timeline_entry_t *entries, int n) {
+    FILE *f = (strcmp(path, "-") == 0) ? stdout : fopen(path, "w");
+    if (!f) return -1;
+    if (fmt == TIMELINE_FMT_SRT || fmt == TIMELINE_FMT_VTT) {
+        if (fmt == TIMELINE_FMT_VTT) fprintf(f, "WEBVTT\n\n");
+        for (int i = 0; i < n; i++) {
+            char a[16], b[16];
+            timeline_fmt_time(a, sizeof(a), entries[i].start_sec, fmt == TIMELINE_FMT_SRT);
+            timeline_fmt_time(b, sizeof(b), entries[i].end_sec, fmt == TIMELINE_FMT_SRT);
+            fprintf(f, "%d\n%s --> %s\n%s\n\n", i + 1, a, b, entries[i].text);
+        }
+    } else if (fmt == TIMELINE_FMT_JSONL) {
+        for (int i = 0; i < n; i++) {
+            fprintf(f, "{\"start\": %.3f, \"end\": %.3f, \"text\": \"",
+                    entries[i].start_sec, entries[i].end_sec);
+            timeline_json_escape(f, entries[i].text);
+            fputs("\"}\n", f);
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            char a[16], b[16];
+            timeline_fmt_time(a, sizeof(a), entries[i].start_sec, 0);
+            timeline_fmt_time(b, sizeof(b), entries[i].end_sec, 0);
+            fprintf(f, "[%s - %s] %s\n", a, b, entries[i].text);
+        }
+    }
+    if (f != stdout) fclose(f);
+    return 0;
 }
 
 /* Parse --past-text value.
@@ -76,6 +164,11 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --past-text <yes|no|auto>  Reuse previously decoded text as context for the next\n");
     fprintf(stderr, "                             segment/chunk (continuity bias; auto=yes for --stream)\n");
     fprintf(stderr, "  --skip-silence              Drop long silent spans before inference (off by default)\n");
+    fprintf(stderr, "  --timeline-file <path>     Write cue timestamps (offline modes; not --stream/--skip-silence)\n");
+    fprintf(stderr, "                             Format from extension (.srt/.vtt/.jsonl/.txt, default srt);\n");
+    fprintf(stderr, "                             \"-\" = stdout. Uses -S 20 unless -S is set explicitly\n");
+    fprintf(stderr, "  --timeline-format <fmt>    Override timeline format: srt|vtt|jsonl|txt\n");
+    fprintf(stderr, "  --timeline-max-cue-sec <s> Max cue length in seconds (default: 7)\n");
     fprintf(stderr, "  --prompt <text>            System prompt for biasing (example: \"Preserve spelling: CPU, CUDA, PostgreSQL, Redis\")\n");
     fprintf(stderr, "  --language <lang>          Force output language via token conditioning\n");
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
@@ -102,6 +195,9 @@ int main(int argc, char **argv) {
     int past_text_conditioning_mode = -1; /* -1 auto, 0 off, 1 on */
     int skip_silence = 0;
     int emit_tokens = 1;
+    const char *timeline_file = NULL;
+    const char *timeline_format = NULL;
+    float timeline_max_cue_sec = -1.0f; /* -1 = use default (7) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -155,6 +251,15 @@ int main(int argc, char **argv) {
             return 1;
         } else if (strcmp(argv[i], "--skip-silence") == 0) {
             skip_silence = 1;
+        } else if (strcmp(argv[i], "--timeline-file") == 0 && i + 1 < argc) {
+            timeline_file = argv[++i];
+        } else if (strcmp(argv[i], "--timeline-file") == 0) {
+            fprintf(stderr, "Error: --timeline-file requires a path (or - for stdout)\n");
+            return 1;
+        } else if (strcmp(argv[i], "--timeline-format") == 0 && i + 1 < argc) {
+            timeline_format = argv[++i];
+        } else if (strcmp(argv[i], "--timeline-max-cue-sec") == 0 && i + 1 < argc) {
+            timeline_max_cue_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt_text = argv[++i];
         } else if (strcmp(argv[i], "--language") == 0 && i + 1 < argc) {
@@ -193,6 +298,31 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: -i and --stdin are mutually exclusive\n");
         return 1;
     }
+    if (timeline_file && stream_mode) {
+        fprintf(stderr, "Error: --timeline-file is not supported with --stream\n");
+        return 1;
+    }
+    if (timeline_file && skip_silence) {
+        fprintf(stderr, "Error: --timeline-file cannot be combined with --skip-silence\n");
+        return 1;
+    }
+    int timeline_fmt = -1;
+    if (timeline_format) {
+        timeline_fmt = parse_timeline_format(timeline_format);
+        if (timeline_fmt < 0) {
+            fprintf(stderr, "Error: --timeline-format must be one of srt|vtt|jsonl|txt, got '%s'\n",
+                    timeline_format);
+            return 1;
+        }
+    } else if (timeline_file) {
+        timeline_fmt = infer_timeline_format(timeline_file);
+    }
+    if (timeline_file && segment_sec < 0) {
+        /* Timeline granularity comes from segment boundaries. */
+        segment_sec = 20.0f;
+        if (verbosity >= 1)
+            fprintf(stderr, "Timeline: enabling segmented mode (-S 20) for timestamp granularity\n");
+    }
 
     qwen_verbose = verbosity;
     emit_tokens = (verbosity > 0);
@@ -225,6 +355,10 @@ int main(int argc, char **argv) {
          * Keep segmented mode default unchanged (off). */
         ctx->past_text_conditioning = 1;
     if (skip_silence) ctx->skip_silence = 1;
+    if (timeline_file) {
+        qwen_set_timeline(ctx, 1);
+        if (timeline_max_cue_sec > 0) qwen_set_timeline_max_cue_sec(ctx, timeline_max_cue_sec);
+    }
     if (prompt_text && qwen_set_prompt(ctx, prompt_text) != 0) {
         fprintf(stderr, "Failed to set --prompt text\n");
         qwen_free(ctx);
@@ -274,6 +408,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Transcription failed\n");
         qwen_free(ctx);
         return 1;
+    }
+
+    if (timeline_file) {
+        const qwen_timeline_entry_t *entries = NULL;
+        int n_entries = qwen_get_timeline(ctx, &entries);
+        if (n_entries <= 0) {
+            fprintf(stderr, "Timeline: no cues collected\n");
+        } else if (write_timeline_file(timeline_file, timeline_fmt, entries, n_entries) != 0) {
+            fprintf(stderr, "Timeline: failed to write %s\n", timeline_file);
+        } else if (verbosity >= 1) {
+            fprintf(stderr, "Timeline: %d cues written to %s\n", n_entries, timeline_file);
+        }
     }
 
     if (verbosity >= 1) {

@@ -172,6 +172,18 @@ typedef struct {
 typedef void (*qwen_token_cb)(const char *piece, void *userdata);
 
 /* ========================================================================
+ * Timeline (approximate transcription timestamps)
+ * ======================================================================== */
+
+/* One timed text cue. start_sec/end_sec are absolute positions in the
+ * transcribed audio; 'text' is UTF-8 owned by the context. */
+typedef struct {
+    float start_sec;
+    float end_sec;
+    char *text;
+} qwen_timeline_entry_t;
+
+/* ========================================================================
  * Main Context
  * ======================================================================== */
 
@@ -226,6 +238,13 @@ typedef struct {
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */
+
+    /* Timeline collection (approximate cue timestamps; offline modes only) */
+    int timeline_enabled;          /* 1=collect entries during transcription */
+    float timeline_max_cue_sec;    /* max cue length in seconds (default 7) */
+    qwen_timeline_entry_t *timeline_entries;
+    int n_timeline_entries;
+    int timeline_cap;              /* allocated entries */
 
     /* Optional prompt/language controls */
     char *prompt;                  /* system prompt text (UTF-8) */
@@ -284,6 +303,27 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language);
 
 /* Comma-separated supported language names for --language. */
 const char *qwen_supported_languages_csv(void);
+
+/* Enable collection of approximate timeline cues for the next transcription
+ * (qwen_transcribe / qwen_transcribe_audio / qwen_transcribe_stdin).
+ * Requires segmented mode (-S > 0) for useful granularity; with -S 0 a
+ * single cue covering the whole audio is produced. Incompatible with
+ * --skip-silence (collection is skipped with a warning). Not supported by
+ * the streaming entry points. Entries accumulate across transcribe calls;
+ * read them with qwen_get_timeline() and clear with qwen_timeline_reset(). */
+void qwen_set_timeline(qwen_ctx_t *ctx, int enabled);
+
+/* Set the maximum cue length in seconds (default 7.0, values <= 0 restore
+ * the default). Cues are split at punctuation to respect this limit. */
+void qwen_set_timeline_max_cue_sec(qwen_ctx_t *ctx, float max_cue_sec);
+
+/* Fetch collected timeline entries. Returns the entry count (0 if none);
+ * *entries receives the array pointer, valid until qwen_timeline_reset()
+ * or qwen_free(). The entries are owned by the context. */
+int qwen_get_timeline(qwen_ctx_t *ctx, const qwen_timeline_entry_t **entries);
+
+/* Free and clear any collected timeline entries. */
+void qwen_timeline_reset(qwen_ctx_t *ctx);
 
 /* Transcribe a WAV file, returns allocated string (caller must free) */
 char *qwen_transcribe(qwen_ctx_t *ctx, const char *wav_path);

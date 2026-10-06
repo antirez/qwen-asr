@@ -33,6 +33,34 @@ void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) 
     ctx->token_cb_userdata = userdata;
 }
 
+void qwen_set_timeline(qwen_ctx_t *ctx, int enabled) {
+    if (!ctx) return;
+    ctx->timeline_enabled = enabled ? 1 : 0;
+}
+
+void qwen_set_timeline_max_cue_sec(qwen_ctx_t *ctx, float max_cue_sec) {
+    if (!ctx) return;
+    if (max_cue_sec <= 0.0f) max_cue_sec = 7.0f;
+    ctx->timeline_max_cue_sec = max_cue_sec;
+}
+
+int qwen_get_timeline(qwen_ctx_t *ctx, const qwen_timeline_entry_t **entries) {
+    if (!ctx) return 0;
+    if (entries) *entries = ctx->timeline_entries;
+    return ctx->n_timeline_entries;
+}
+
+void qwen_timeline_reset(qwen_ctx_t *ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < ctx->n_timeline_entries; i++) {
+        free(ctx->timeline_entries[i].text);
+    }
+    free(ctx->timeline_entries);
+    ctx->timeline_entries = NULL;
+    ctx->n_timeline_entries = 0;
+    ctx->timeline_cap = 0;
+}
+
 static const char *QWEN_SUPPORTED_LANGUAGES[] = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -258,6 +286,13 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
 
+    /* Timeline defaults */
+    ctx->timeline_enabled = 0;
+    ctx->timeline_max_cue_sec = 7.0f;
+    ctx->timeline_entries = NULL;
+    ctx->n_timeline_entries = 0;
+    ctx->timeline_cap = 0;
+
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;
 }
@@ -274,6 +309,8 @@ void qwen_free(qwen_ctx_t *ctx) {
 #elif defined(USE_CUDA)
     qwen_cuda_free(ctx);
 #endif
+
+    qwen_timeline_reset(ctx);
 
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
@@ -860,6 +897,462 @@ static void segment_emit_cb(const char *piece, void *userdata) {
     st->downstream_cb(piece, st->downstream_userdata);
 }
 
+/* ========================================================================
+ * Timeline collection (approximate cue timestamps)
+ *
+ * Segment boundaries are exact (they come from the -S silence search).
+ * Inside a segment the text is split at punctuation and distributed
+ * proportionally over the speech-active windows, snapping cue boundaries
+ * to nearby silences. This is a heuristic: within-segment times are
+ * estimates, not word-accurate alignments.
+ * ======================================================================== */
+
+#define TIMELINE_WIN              160   /* 10 ms analysis window at 16 kHz */
+#define TIMELINE_BASE_THRESH      0.002f
+#define TIMELINE_MAX_THRESH       0.025f
+#define TIMELINE_SMOOTH_ALPHA     0.2f
+#define TIMELINE_MIN_VOICE_WINS   5     /* discard speech bursts < 50 ms */
+#define TIMELINE_PAD_WINS         3     /* 30 ms pad around speech edges */
+#define TIMELINE_MIN_SILENCE_WINS 30    /* silences >= 300 ms are snap anchors */
+#define TIMELINE_SNAP_WINS        120   /* max snap distance 1.2 s */
+
+/* Same energy/threshold model as compact_silence(), but instead of
+ * compacting the audio it returns a per-window voice flag array
+ * (n_windows entries, malloc'd). Returns NULL on failure. */
+static unsigned char *timeline_voice_windows(const float *samples, int n_samples,
+                                             int *out_n_windows) {
+    *out_n_windows = 0;
+    if (!samples || n_samples <= 0) return NULL;
+    int n_win = (n_samples + TIMELINE_WIN - 1) / TIMELINE_WIN;
+    float *rms = (float *)malloc((size_t)n_win * sizeof(float));
+    float *sorted = (float *)malloc((size_t)n_win * sizeof(float));
+    float *smooth = (float *)malloc((size_t)n_win * sizeof(float));
+    unsigned char *flags = (unsigned char *)malloc((size_t)n_win);
+    if (!rms || !sorted || !smooth || !flags) {
+        free(rms); free(sorted); free(smooth); free(flags);
+        return NULL;
+    }
+    for (int w = 0; w < n_win; w++) {
+        int start = w * TIMELINE_WIN;
+        int end = start + TIMELINE_WIN;
+        if (end > n_samples) end = n_samples;
+        int len = end - start;
+        float energy = 0.0f;
+        for (int i = 0; i < len; i++) {
+            float v = samples[start + i];
+            energy += v * v;
+        }
+        rms[w] = sqrtf(energy / (float)(len > 0 ? len : 1));
+    }
+    float ema = rms[0];
+    for (int w = 0; w < n_win; w++) {
+        ema = (1.0f - TIMELINE_SMOOTH_ALPHA) * ema + TIMELINE_SMOOTH_ALPHA * rms[w];
+        smooth[w] = ema;
+    }
+    memcpy(sorted, smooth, (size_t)n_win * sizeof(float));
+    qsort(sorted, (size_t)n_win, sizeof(float), cmp_float_asc);
+    int p25 = (int)((n_win - 1) * 0.25f);
+    float thresh = sorted[p25] * 1.8f;
+    if (thresh < TIMELINE_BASE_THRESH) thresh = TIMELINE_BASE_THRESH;
+    if (thresh > TIMELINE_MAX_THRESH) thresh = TIMELINE_MAX_THRESH;
+    for (int w = 0; w < n_win; w++) flags[w] = (smooth[w] > thresh) ? 1 : 0;
+    free(rms); free(sorted); free(smooth);
+    /* Remove very short voice bursts (clicks/hiss spikes). */
+    for (int i = 0; i < n_win; ) {
+        if (!flags[i]) { i++; continue; }
+        int j = i + 1;
+        while (j < n_win && flags[j]) j++;
+        if (j - i < TIMELINE_MIN_VOICE_WINS) memset(flags + i, 0, (size_t)(j - i));
+        i = j;
+    }
+    *out_n_windows = n_win;
+    return flags;
+}
+
+/* Decode one UTF-8 codepoint; returns the byte length (1 for invalid bytes). */
+static int timeline_utf8_decode(const char *s, unsigned int *cp) {
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    int len; unsigned int v;
+    if ((c & 0xE0) == 0xC0) { len = 2; v = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { len = 3; v = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { len = 4; v = c & 0x07; }
+    else { *cp = c; return 1; }
+    for (int i = 1; i < len; i++) {
+        unsigned char cc = (unsigned char)s[i];
+        if ((cc & 0xC0) != 0x80) { *cp = c; return 1; }
+        v = (v << 6) | (cc & 0x3F);
+    }
+    *cp = v;
+    return len;
+}
+
+static int timeline_count_codepoints(const char *s, int bytes) {
+    int count = 0, bp = 0;
+    unsigned int cp;
+    while (bp < bytes) bp += timeline_utf8_decode(s + bp, &cp), count++;
+    return count;
+}
+
+/* Sentence enders: ASCII . ! ? and CJK 。 ！ ？ … */
+static int timeline_cp_is_sentence(unsigned int cp) {
+    return cp == '.' || cp == '!' || cp == '?' ||
+           cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F || cp == 0x2026;
+}
+
+/* Clause separators: ASCII , ; : and CJK ， 、 ； ： */
+static int timeline_cp_is_clause(unsigned int cp) {
+    return cp == ',' || cp == ';' || cp == ':' ||
+           cp == 0xFF0C || cp == 0x3001 || cp == 0xFF1B || cp == 0xFF1A;
+}
+
+/* A sentence break must be plausible: ASCII '.' followed by a non-space
+ * ASCII byte (e.g. "3.5", "U.S.") is not a sentence end. */
+static int timeline_sentence_break(const char *s, int bp, int blen, unsigned int cp) {
+    if (!timeline_cp_is_sentence(cp)) return 0;
+    if (cp == '.') {
+        unsigned char next = (unsigned char)s[bp + blen];
+        if (next > 0x20 && next < 0x80) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    const char *ptr;
+    int bytes;
+    int codepoints;
+} timeline_span_t;
+
+/* Split text into cue-sized spans: sentence punctuation first, clause
+ * punctuation when a sentence exceeds max_cue_sec, then hard splits.
+ * Tiny spans (below ~0.8s of speech) are merged into the following one.
+ * Caller frees the returned array. */
+static timeline_span_t *timeline_split_cues(const char *text, float speech_sec,
+                                            float max_cue_sec, int *out_n) {
+    *out_n = 0;
+    if (!text) return NULL;
+    int len = (int)strlen(text);
+    if (len <= 0) return NULL;
+
+    /* Estimate this segment's characters-per-second of speech. Cap the
+     * rate so an under-detected speech span (e.g. voice over music)
+     * cannot inflate the cue budget. */
+    int total_cp = timeline_count_codepoints(text, len);
+    float cps = (speech_sec > 0.2f) ? (float)total_cp / speech_sec : 4.0f;
+    if (cps < 1.0f) cps = 1.0f;
+    if (cps > 8.0f) cps = 8.0f;
+    int max_cp = (int)(cps * max_cue_sec + 0.5f);
+    if (max_cp < 6) max_cp = 6;
+    int min_cp = (int)(cps * 0.8f + 0.5f);
+    if (min_cp < 3) min_cp = 3;
+
+    timeline_span_t *spans = (timeline_span_t *)malloc((size_t)(len + 1) * sizeof(*spans));
+    if (!spans) return NULL;
+    int n = 0;
+
+    /* Pass 1: split at sentence punctuation. */
+    {
+        int start = 0, bp = 0;
+        unsigned int cp;
+        while (bp < len) {
+            int blen = timeline_utf8_decode(text + bp, &cp);
+            bp += blen;
+            if (timeline_sentence_break(text, bp - blen, blen, cp)) {
+                spans[n].ptr = text + start;
+                spans[n].bytes = bp - start;
+                spans[n].codepoints = 0;
+                n++;
+                start = bp;
+            }
+        }
+        if (start < len) {
+            spans[n].ptr = text + start;
+            spans[n].bytes = len - start;
+            spans[n].codepoints = 0;
+            n++;
+        }
+    }
+
+    /* Pass 2: sub-split oversized sentences at clause punctuation
+     * (break after the first clause mark past half the budget). */
+    for (int i = 0; i < n; i++) {
+        if (spans[i].bytes <= 0) continue;
+        spans[i].codepoints = timeline_count_codepoints(spans[i].ptr, spans[i].bytes);
+    }
+    int cap = n + total_cp; /* worst case: every codepoint its own span */
+    timeline_span_t *out = (timeline_span_t *)malloc((size_t)cap * sizeof(*out));
+    if (!out) { free(spans); return NULL; }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (spans[i].codepoints <= max_cp) {
+            out[m++] = spans[i];
+            continue;
+        }
+        const char *p = spans[i].ptr;
+        int start = 0, bp = 0, cnt = 0, last_space = -1, last_space_cp = 0;
+        unsigned int cp;
+        while (bp < spans[i].bytes) {
+            int blen = timeline_utf8_decode(p + bp, &cp);
+            bp += blen;
+            cnt++;
+            if (cp == ' ' || cp == '\t') { last_space = bp; last_space_cp = cnt; }
+            int clause = (timeline_cp_is_clause(cp) && cnt >= max_cp / 2);
+            int hard = (cnt >= max_cp);
+            if (!clause && !hard) continue;
+            int brk = bp, brk_cnt = cnt;
+            if (hard && !clause && last_space > start) {
+                /* Spaced scripts (Latin, Cyrillic, ...): never split a
+                 * word — fall back to the last word boundary. */
+                brk = last_space;
+                brk_cnt = last_space_cp;
+            }
+            out[m].ptr = p + start;
+            out[m].bytes = brk - start;
+            out[m].codepoints = 0;
+            m++;
+            start = brk;
+            cnt -= brk_cnt;
+            last_space = -1;
+            last_space_cp = 0;
+        }
+        if (start < spans[i].bytes) {
+            out[m].ptr = p + start;
+            out[m].bytes = spans[i].bytes - start;
+            out[m].codepoints = 0;
+            m++;
+        }
+    }
+    free(spans);
+    spans = out;
+    n = m;
+
+    /* Pass 3: merge tiny spans forward (last one merges backward). */
+    m = 0;
+    for (int i = 0; i < n; i++) {
+        if (spans[i].bytes <= 0) continue;
+        if (spans[i].codepoints == 0)
+            spans[i].codepoints = timeline_count_codepoints(spans[i].ptr, spans[i].bytes);
+        if (m > 0 && spans[i].codepoints < min_cp &&
+            (i + 1 < n || m > 0) && i == n - 1) {
+            /* last tiny span: merge into previous */
+            spans[m - 1].bytes += spans[i].bytes;
+            spans[m - 1].codepoints += spans[i].codepoints;
+        } else if (m > 0 && spans[m - 1].codepoints < min_cp) {
+            /* previous span was tiny: extend it with this one */
+            spans[m - 1].bytes += spans[i].bytes;
+            spans[m - 1].codepoints += spans[i].codepoints;
+        } else {
+            spans[m++] = spans[i];
+        }
+    }
+    /* If only one tiny span exists it is kept as-is. */
+    *out_n = m;
+    return spans;
+}
+
+/* Append one timeline entry (text is copied and whitespace-trimmed). */
+static int timeline_append(qwen_ctx_t *ctx, float start_sec, float end_sec,
+                           const char *text, int nbytes) {
+    if (!ctx || !text || nbytes <= 0) return 0;
+    while (nbytes > 0 && isspace((unsigned char)text[0])) { text++; nbytes--; }
+    while (nbytes > 0 && isspace((unsigned char)text[nbytes - 1])) nbytes--;
+    if (nbytes <= 0) return 0;
+    if (end_sec < start_sec) { float t = start_sec; start_sec = end_sec; end_sec = t; }
+    if (end_sec - start_sec < 0.01f) end_sec = start_sec + 0.01f;
+    if (ctx->n_timeline_entries >= ctx->timeline_cap) {
+        int cap = ctx->timeline_cap > 0 ? ctx->timeline_cap * 2 : 16;
+        qwen_timeline_entry_t *e = (qwen_timeline_entry_t *)realloc(
+            ctx->timeline_entries, (size_t)cap * sizeof(*e));
+        if (!e) return 0;
+        ctx->timeline_entries = e;
+        ctx->timeline_cap = cap;
+    }
+    qwen_timeline_entry_t *e = &ctx->timeline_entries[ctx->n_timeline_entries];
+    e->text = (char *)malloc((size_t)nbytes + 1);
+    if (!e->text) return 0;
+    memcpy(e->text, text, (size_t)nbytes);
+    e->text[nbytes] = '\0';
+    e->start_sec = start_sec;
+    e->end_sec = end_sec;
+    ctx->n_timeline_entries++;
+    return 1;
+}
+
+/* Distribute one segment's text over its speech-active windows and append
+ * the resulting cues to the context timeline. core_start/core_end are
+ * absolute sample offsets of the segment. */
+static void timeline_add_segment(qwen_ctx_t *ctx, const unsigned char *voice,
+                                 int n_windows, int core_start, int core_end,
+                                 const char *seg_text, float max_cue_sec) {
+    if (!ctx || !voice || !seg_text || core_end <= core_start) return;
+    int w0 = core_start / TIMELINE_WIN;
+    int w1 = (core_end + TIMELINE_WIN - 1) / TIMELINE_WIN;
+    if (w1 > n_windows) w1 = n_windows;
+    int n = w1 - w0;
+    if (n < 2) {
+        timeline_append(ctx, (float)core_start / QWEN_SAMPLE_RATE,
+                        (float)core_end / QWEN_SAMPLE_RATE,
+                        seg_text, (int)strlen(seg_text));
+        return;
+    }
+
+    /* Speech runs (edge-padded, merged) and snap-anchor silence runs. */
+    int max_runs = n / 2 + 2;
+    int *sp_start = (int *)malloc((size_t)max_runs * sizeof(int));
+    int *sp_end = (int *)malloc((size_t)max_runs * sizeof(int));
+    int *si_start = (int *)malloc((size_t)max_runs * sizeof(int));
+    int *si_end = (int *)malloc((size_t)max_runs * sizeof(int));
+    if (!sp_start || !sp_end || !si_start || !si_end) {
+        free(sp_start); free(sp_end); free(si_start); free(si_end);
+        return;
+    }
+    int ns = 0, ni = 0, i = 0;
+    while (i < n) {
+        if (voice[w0 + i]) {
+            int j = i;
+            while (j < n && voice[w0 + j]) j++;
+            int a = i - TIMELINE_PAD_WINS; if (a < 0) a = 0;
+            int b = j + TIMELINE_PAD_WINS; if (b > n) b = n;
+            if (ns > 0 && a <= sp_end[ns - 1]) {
+                if (b > sp_end[ns - 1]) sp_end[ns - 1] = b;
+            } else {
+                sp_start[ns] = a;
+                sp_end[ns] = b;
+                ns++;
+            }
+            i = j;
+        } else {
+            int j = i;
+            while (j < n && !voice[w0 + j]) j++;
+            if (j - i >= TIMELINE_MIN_SILENCE_WINS) {
+                si_start[ni] = i;
+                si_end[ni] = j;
+                ni++;
+            }
+            i = j;
+        }
+    }
+    int speech_windows = 0;
+    for (i = 0; i < ns; i++) speech_windows += sp_end[i] - sp_start[i];
+    if (speech_windows <= 0) {
+        /* Nothing detected (e.g. music-only or threshold miss): fall back
+         * to a plain proportional layout over the whole segment. */
+        sp_start[0] = 0;
+        sp_end[0] = n;
+        ns = 1;
+        speech_windows = n;
+    }
+
+    int n_cues = 0;
+    timeline_span_t *cues = timeline_split_cues(seg_text, speech_windows * 0.01f,
+                                                max_cue_sec, &n_cues);
+    if (!cues || n_cues <= 0) {
+        free(cues); free(sp_start); free(sp_end); free(si_start); free(si_end);
+        return;
+    }
+    long total_cp = 0;
+    for (i = 0; i < n_cues; i++) total_cp += cues[i].codepoints;
+    if (total_cp <= 0) total_cp = n_cues;
+
+    /* Raw proportional boundaries: walk speech windows, skipping silence. */
+    float *bnd = (float *)malloc((size_t)(n_cues + 1) * sizeof(float));
+    if (!bnd) {
+        free(cues); free(sp_start); free(sp_end); free(si_start); free(si_end);
+        return;
+    }
+    bnd[0] = 0.0f;
+    bnd[n_cues] = (float)n;
+    {
+        /* Boundary i sits where the first i cues' codepoint share ends.
+         * Walk the speech runs (skipping silence) to that share. */
+        float consumed = 0.0f;
+        long cum = (n_cues > 0) ? cues[0].codepoints : 0;
+        int run = 0;
+        float run_pos = 0.0f;
+        for (i = 1; i < n_cues; i++) {
+            float target = (float)speech_windows * (float)cum / (float)total_cp;
+            float need = target - consumed;
+            while (need > 0.0f && run < ns) {
+                float avail = (float)(sp_end[run] - sp_start[run]) - run_pos;
+                if (avail <= need) {
+                    need -= avail;
+                    consumed += avail;
+                    run++;
+                    run_pos = 0.0f;
+                } else {
+                    run_pos += need;
+                    consumed = target;
+                    need = 0.0f;
+                }
+            }
+            bnd[i] = (run < ns) ? (float)sp_start[run] + run_pos : (float)n;
+            cum += cues[i].codepoints;
+        }
+    }
+
+    /* Snap boundaries to nearby silence midpoints, then keep cues
+     * monotonic, never collapsing a cue below ~35% of its raw share
+     * (or 30 ms). */
+    float *raw = (float *)malloc((size_t)(n_cues + 1) * sizeof(float));
+    if (raw) memcpy(raw, bnd, (size_t)(n_cues + 1) * sizeof(float));
+    for (i = 1; i < n_cues; i++) {
+        float best = -1.0f, best_d = (float)TIMELINE_SNAP_WINS;
+        for (int j = 0; j < ni; j++) {
+            float mid = 0.5f * (float)(si_start[j] + si_end[j]);
+            float d = fabsf(mid - bnd[i]);
+            if (d < best_d) { best_d = d; best = mid; }
+        }
+        if (best >= 0.0f) bnd[i] = best;
+    }
+    for (i = 1; i <= n_cues; i++) {
+        float minw = 3.0f;
+        if (raw) {
+            float share = raw[i] - raw[i - 1];
+            if (0.35f * share > minw) minw = 0.35f * share;
+        }
+        float lb = bnd[i - 1] + minw;
+        if (bnd[i] < lb) {
+            bnd[i] = (lb <= (float)n) ? lb : (float)n;
+        }
+    }
+
+    if (qwen_verbose >= 2) {
+        fprintf(stderr, "Timeline: segment %.2f-%.2fs, %d/%d speech windows, %d cues\n",
+                (float)core_start / QWEN_SAMPLE_RATE,
+                (float)core_end / QWEN_SAMPLE_RATE,
+                speech_windows, n, n_cues);
+        for (i = 0; i < n_cues; i++) {
+            if (raw) {
+                fprintf(stderr, "  cue %d: %.2f-%.2fs (raw %.2f-%.2fs) %.*s\n",
+                        i + 1, (float)(w0 + (int)(bnd[i] + 0.5f)) * 0.01f,
+                        (float)(w0 + (int)(bnd[i + 1] + 0.5f)) * 0.01f,
+                        (float)(w0 + (int)(raw[i] + 0.5f)) * 0.01f,
+                        (float)(w0 + (int)(raw[i + 1] + 0.5f)) * 0.01f,
+                        cues[i].bytes, cues[i].ptr);
+            } else {
+                fprintf(stderr, "  cue %d: %.2f-%.2fs %.*s\n",
+                        i + 1, (float)(w0 + (int)(bnd[i] + 0.5f)) * 0.01f,
+                        (float)(w0 + (int)(bnd[i + 1] + 0.5f)) * 0.01f,
+                        cues[i].bytes, cues[i].ptr);
+            }
+        }
+    }
+
+    for (i = 0; i < n_cues; i++) {
+        int a = (int)(bnd[i] + 0.5f);
+        int b = (int)(bnd[i + 1] + 0.5f);
+        if (b <= a) b = a + 1;
+        timeline_append(ctx, (float)(w0 + a) * 0.01f,
+                        (float)(w0 + b) * 0.01f,
+                        cues[i].ptr, cues[i].bytes);
+    }
+
+    free(raw);
+    free(bnd);
+    free(cues);
+    free(sp_start); free(sp_end); free(si_start); free(si_end);
+}
+
 char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->perf_total_ms = 0;
     ctx->perf_text_tokens = 0;
@@ -901,6 +1394,21 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
         return NULL;
     }
 
+    /* Timeline collection: analyze speech activity on the original samples.
+     * Not compatible with --skip-silence, which loses absolute time. */
+    unsigned char *voice_windows = NULL;
+    int n_voice_windows = 0;
+    int timeline_on = ctx->timeline_enabled;
+    if (timeline_on && ctx->skip_silence) {
+        if (qwen_verbose >= 1)
+            fprintf(stderr, "Timeline: disabled (--skip-silence discards absolute time)\n");
+        timeline_on = 0;
+    }
+    if (timeline_on && n_samples > 0) {
+        voice_windows = timeline_voice_windows(samples, n_samples, &n_voice_windows);
+        if (!voice_windows) timeline_on = 0;
+    }
+
     /* Determine segment boundaries.
      * Clamp search window to half the segment size so split points
      * can never overlap and produce zero-length segments. */
@@ -912,6 +1420,13 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     /* No splitting if segment_sec is 0 or audio fits in one segment */
     if (ctx->segment_sec <= 0 || audio_n_samples <= target_samples + margin_samples) {
         char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
+        if (timeline_on && text && text[0] != '\0') {
+            /* Still split the text into cues inside this single span. */
+            timeline_add_segment(ctx, voice_windows, n_voice_windows,
+                                 0, audio_n_samples, text,
+                                 ctx->timeline_max_cue_sec);
+        }
+        free(voice_windows);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
         return text;
@@ -1047,6 +1562,12 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
             continue;
         }
 
+        if (timeline_on && voice_windows) {
+            timeline_add_segment(ctx, voice_windows, n_voice_windows,
+                                 core_start, core_end, seg_text + cut_pos,
+                                 ctx->timeline_max_cue_sec);
+        }
+
         size_t add_len = strlen(seg_text + cut_pos);
         int need_space = should_insert_boundary_space(
             result_len > 0 ? (int)(unsigned char)result[result_len - 1] : 0,
@@ -1070,6 +1591,7 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
     ctx->token_cb = saved_cb;
     ctx->token_cb_userdata = saved_cb_userdata;
     qwen_tokenizer_free(tokenizer);
+    free(voice_windows);
     free(compacted_samples);
     return result;
 }
