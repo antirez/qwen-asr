@@ -55,7 +55,7 @@ static void usage(const char *prog) {
 #endif
     fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
-    fprintf(stderr, "  -d <dir>      Model directory (with *.safetensors, vocab.json)\n");
+    fprintf(stderr, "  -d <dir>      Model directory (with *.safetensors, vocab.json or tokenizer.json)\n");
     fprintf(stderr, "  -i <file>     Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");

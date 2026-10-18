@@ -145,11 +145,15 @@ static int detect_config(qwen_ctx_t *ctx) {
      * 1.7B has 2 shards, 0.6B has 1 shard
      * But we can also check a specific weight shape. */
 
-    /* Check if thinker.audio_tower.layers.17 exists (0.6B has 18 layers, 1.7B has 24) */
     multi_safetensors_t *ms = (multi_safetensors_t *)ctx->safetensors;
 
-    /* Check for layer 18 (0-indexed) in encoder - if it exists, it's 1.7B */
-    const safetensor_t *test = multi_safetensors_find(ms,
+    /* -hf repos rename thinker.* to model.* */
+    cfg->hf_layout = multi_safetensors_find(ms,
+        "model.audio_tower.conv2d1.weight", NULL) != NULL;
+
+    /* Encoder layer 18 exists only in 1.7B (24 layers vs 18) */
+    const safetensor_t *test = multi_safetensors_find(ms, cfg->hf_layout ?
+        "model.audio_tower.layers.18.self_attn.q_proj.weight" :
         "thinker.audio_tower.layers.18.self_attn.q_proj.weight", NULL);
 
     if (test) {
@@ -888,9 +892,7 @@ char *qwen_transcribe_audio(qwen_ctx_t *ctx, const float *samples, int n_samples
                 audio_n_samples, (float)audio_n_samples / QWEN_SAMPLE_RATE);
 
     /* Load tokenizer once for all segments */
-    char vocab_path[1024];
-    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", ctx->model_dir);
-    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(vocab_path);
+    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(ctx->model_dir);
     if (!tokenizer) {
         free(compacted_samples);
         return NULL;
@@ -1365,9 +1367,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     }
 
     /* Load tokenizer */
-    char vocab_path[1024];
-    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", ctx->model_dir);
-    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(vocab_path);
+    qwen_tokenizer_t *tokenizer = qwen_tokenizer_load(ctx->model_dir);
     if (!tokenizer) {
         free(compacted_samples);
         return NULL;

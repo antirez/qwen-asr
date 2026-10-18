@@ -45,10 +45,11 @@ static uint16_t *load_bf16_direct(multi_safetensors_t *ms, const char *name) {
 int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
                        const qwen_config_t *cfg) {
     char name[512];
+    const char *pfx = cfg->hf_layout ? "model.language_model." : "thinker.model.";
 
     /* Token embeddings (large, bf16 mmap direct) */
-    dec->tok_embeddings_bf16 = load_bf16_direct(ms,
-        "thinker.model.embed_tokens.weight");
+    snprintf(name, sizeof(name), "%sembed_tokens.weight", pfx);
+    dec->tok_embeddings_bf16 = load_bf16_direct(ms, name);
     if (!dec->tok_embeddings_bf16) return -1;
 
     /* Transformer layers */
@@ -56,33 +57,33 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
         qwen_dec_layer_t *l = &dec->layers[i];
 
         /* Attention weights (bf16, no bias) */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.q_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_proj.weight", pfx, i);
         l->wq_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.k_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_proj.weight", pfx, i);
         l->wk_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.v_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.v_proj.weight", pfx, i);
         l->wv_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.o_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.o_proj.weight", pfx, i);
         l->wo_weight_bf16 = load_bf16_direct(ms, name);
 
         /* Per-head Q/K RMSNorm weights */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.q_norm.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_norm.weight", pfx, i);
         l->q_norm_weight = load_f32(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.self_attn.k_norm.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_norm.weight", pfx, i);
         l->k_norm_weight = load_f32(ms, name);
 
         /* RMSNorm weights */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.input_layernorm.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.input_layernorm.weight", pfx, i);
         l->input_norm = load_f32(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.post_attention_layernorm.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.post_attention_layernorm.weight", pfx, i);
         l->post_attn_norm = load_f32(ms, name);
 
         /* SwiGLU MLP weights (bf16, no bias) */
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.gate_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.mlp.gate_proj.weight", pfx, i);
         l->gate_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.up_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.mlp.up_proj.weight", pfx, i);
         l->up_weight_bf16 = load_bf16_direct(ms, name);
-        snprintf(name, sizeof(name), "thinker.model.layers.%d.mlp.down_proj.weight", i);
+        snprintf(name, sizeof(name), "%slayers.%d.mlp.down_proj.weight", pfx, i);
         l->down_weight_bf16 = load_bf16_direct(ms, name);
 
         if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
@@ -111,7 +112,8 @@ int qwen_decoder_load(qwen_decoder_t *dec, multi_safetensors_t *ms,
     }
 
     /* Final RMSNorm */
-    dec->norm = load_f32(ms, "thinker.model.norm.weight");
+    snprintf(name, sizeof(name), "%snorm.weight", pfx);
+    dec->norm = load_f32(ms, name);
     if (!dec->norm) return -1;
 
     return 0;

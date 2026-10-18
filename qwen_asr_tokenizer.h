@@ -3,7 +3,7 @@
  *
  * Supports:
  *  - decode token ID -> UTF-8 text
- *  - encode UTF-8 text -> token IDs (vocab.json + merges.txt)
+ *  - encode UTF-8 text -> token IDs (vocab.json + merges.txt, or tokenizer.json)
  */
 
 #ifndef QWEN_ASR_TOKENIZER_H
@@ -21,8 +21,8 @@ typedef struct {
     int merge_map_cap;
 } qwen_tokenizer_t;
 
-/* Load tokenizer from vocab.json in model directory */
-qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path);
+/* Load from model dir: vocab.json + merges.txt, else tokenizer.json (-hf repos) */
+qwen_tokenizer_t *qwen_tokenizer_load(const char *model_dir);
 
 /* Decode a single token ID to text. Returns pointer to internal string. */
 const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id);

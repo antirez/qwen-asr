@@ -3,7 +3,8 @@
  *
  * Supports:
  *   - decode token IDs to UTF-8 text (for ASR output assembly)
- *   - encode UTF-8 text to token IDs using vocab.json + merges.txt
+ *   - encode UTF-8 text to token IDs using vocab.json + merges.txt,
+ *     or tokenizer.json (HF tokenizers format)
  */
 
 #include "qwen_asr_tokenizer.h"
@@ -117,7 +118,7 @@ static char *decode_gpt2_token(const char *token_str) {
 }
 
 /* ========================================================================
- * Simple JSON parser for vocab.json
+ * Simple JSON parser for vocab.json / tokenizer.json
  * ======================================================================== */
 
 static void skip_ws(const char **p) {
@@ -410,20 +411,6 @@ static int encode_bpe_word(const qwen_tokenizer_t *tok, const char *mapped, int 
     return 0;
 }
 
-static int derive_merges_path(const char *vocab_path, char *out_path, size_t out_cap) {
-    const char *slash = strrchr(vocab_path, '/');
-    if (!slash) {
-        if (snprintf(out_path, out_cap, "merges.txt") >= (int)out_cap) return -1;
-        return 0;
-    }
-    size_t dir_len = (size_t)(slash - vocab_path);
-    if (dir_len + 12 >= out_cap) return -1;
-    memcpy(out_path, vocab_path, dir_len);
-    out_path[dir_len] = '\0';
-    snprintf(out_path + dir_len, out_cap - dir_len, "/merges.txt");
-    return 0;
-}
-
 static void trim_newline(char *line) {
     size_t n = strlen(line);
     while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
@@ -434,7 +421,6 @@ static int parse_merge_pair(char *line, char **a, char **b) {
     *b = NULL;
     trim_newline(line);
     if (line[0] == '\0') return -1;
-    if (line[0] == '#') return -1;
 
     char *sp = strchr(line, ' ');
     if (!sp) return -1;
@@ -447,26 +433,45 @@ static int parse_merge_pair(char *line, char **a, char **b) {
     return 0;
 }
 
+static int merge_map_alloc(qwen_tokenizer_t *tok, int n_pairs) {
+    if (n_pairs <= 0) return -1;
+    tok->merge_map_cap = next_pow2(n_pairs * 2);
+    tok->merge_map = calloc((size_t)tok->merge_map_cap, sizeof(str_int_entry_t));
+    if (!tok->merge_map) {
+        tok->merge_map_cap = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static void merge_map_add(qwen_tokenizer_t *tok, const char *a, const char *b, int rank) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *key = (char *)malloc(la + 1 + lb + 1);
+    if (!key) return;
+    memcpy(key, a, la);
+    key[la] = ' ';
+    memcpy(key + la + 1, b, lb);
+    key[la + 1 + lb] = '\0';
+
+    if (map_insert((str_int_entry_t *)tok->merge_map, tok->merge_map_cap, key, rank) != 0) {
+        free(key);
+    }
+}
+
 static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
     FILE *f = fopen(merges_path, "rb");
     if (!f) return -1;
 
     int n_pairs = 0;
     char line[8192];
+    /* Only "#version" is a header; "# #" etc. are real merges */
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
+        if (strncmp(line, "#version", 8) == 0) continue;
         if (parse_merge_pair(line, &a, &b) == 0) n_pairs++;
     }
-    if (n_pairs <= 0) {
+    if (merge_map_alloc(tok, n_pairs) != 0) {
         fclose(f);
-        return -1;
-    }
-
-    tok->merge_map_cap = next_pow2(n_pairs * 2);
-    tok->merge_map = calloc((size_t)tok->merge_map_cap, sizeof(str_int_entry_t));
-    if (!tok->merge_map) {
-        fclose(f);
-        tok->merge_map_cap = 0;
         return -1;
     }
 
@@ -474,56 +479,148 @@ static int load_merges_map(qwen_tokenizer_t *tok, const char *merges_path) {
     int rank = 0;
     while (fgets(line, sizeof(line), f)) {
         char *a = NULL, *b = NULL;
+        if (strncmp(line, "#version", 8) == 0) continue;
         if (parse_merge_pair(line, &a, &b) != 0) continue;
-
-        size_t la = strlen(a), lb = strlen(b);
-        char *key = (char *)malloc(la + 1 + lb + 1);
-        if (!key) continue;
-        memcpy(key, a, la);
-        key[la] = ' ';
-        memcpy(key + la + 1, b, lb);
-        key[la + 1 + lb] = '\0';
-
-        if (map_insert((str_int_entry_t *)tok->merge_map, tok->merge_map_cap, key, rank) != 0) {
-            free(key);
-        }
-        rank++;
+        merge_map_add(tok, a, b, rank++);
     }
     fclose(f);
     return 0;
 }
 
 /* ========================================================================
- * Public API
+ * tokenizer.json (HF tokenizers format, shipped by the -hf repos)
  * ======================================================================== */
 
-qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
-    FILE *f = fopen(vocab_json_path, "rb");
-    if (!f) {
-        fprintf(stderr, "qwen_tokenizer_load: cannot open %s\n", vocab_json_path);
-        return NULL;
+/* Skip one JSON value of any type. */
+static int skip_json_value(const char **p) {
+    skip_ws(p);
+    if (**p == '"') {
+        (*p)++;
+        while (**p && **p != '"') {
+            if (**p == '\\' && (*p)[1]) (*p)++;
+            (*p)++;
+        }
+        if (**p != '"') return -1;
+        (*p)++;
+        return 0;
     }
+    if (**p == '{' || **p == '[') {
+        int depth = 0;
+        while (**p) {
+            char c = **p;
+            if (c == '"') {
+                if (skip_json_value(p) != 0) return -1;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') {
+                if (--depth == 0) { (*p)++; return 0; }
+            }
+            (*p)++;
+        }
+        return -1;
+    }
+    while (**p && **p != ',' && **p != '}' && **p != ']' &&
+           **p != ' ' && **p != '\n' && **p != '\r' && **p != '\t') (*p)++;
+    return 0;
+}
+
+/* With *p at '{', advance *p to the value of `key`. */
+static int find_json_key(const char **p, const char *key) {
+    skip_ws(p);
+    if (**p != '{') return -1;
+    (*p)++;
+    char k[256];
+    for (;;) {
+        skip_ws(p);
+        if (**p == ',') { (*p)++; continue; }
+        if (**p != '"') return -1;
+        if (parse_json_string(p, k, sizeof(k)) != 0) return -1;
+        skip_ws(p);
+        if (**p != ':') return -1;
+        (*p)++;
+        skip_ws(p);
+        if (strcmp(k, key) == 0) return 0;
+        if (skip_json_value(p) != 0) return -1;
+    }
+}
+
+/* Parse model.merges: either ["a b", ...] or [["a", "b"], ...]. */
+static int load_merges_array(qwen_tokenizer_t *tok, const char *arr) {
+    const char *p = arr;
+    skip_ws(&p);
+    if (*p != '[') return -1;
+
+    int n_pairs = 0;
+    p++;
+    for (;;) {
+        skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == ']' || !*p) break;
+        if (skip_json_value(&p) != 0) return -1;
+        n_pairs++;
+    }
+    if (merge_map_alloc(tok, n_pairs) != 0) return -1;
+
+    p = arr;
+    skip_ws(&p);
+    p++;
+    int rank = 0;
+    char a[4096], b[4096];
+    for (;;) {
+        skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == ']' || !*p) break;
+        if (*p == '[') {
+            p++;
+            if (parse_json_string(&p, a, sizeof(a)) != 0) return -1;
+            skip_ws(&p);
+            if (*p != ',') return -1;
+            p++;
+            if (parse_json_string(&p, b, sizeof(b)) != 0) return -1;
+            skip_ws(&p);
+            if (*p != ']') return -1;
+            p++;
+            merge_map_add(tok, a, b, rank);
+        } else {
+            char *x = NULL, *y = NULL;
+            if (parse_json_string(&p, a, sizeof(a)) != 0) return -1;
+            if (parse_merge_pair(a, &x, &y) == 0) merge_map_add(tok, x, y, rank);
+        }
+        rank++;
+    }
+    return 0;
+}
+
+/* ========================================================================
+ * Loading
+ * ======================================================================== */
+
+static char *read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
 
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    char *json = (char *)malloc((size_t)file_size + 1);
-    if (!json || fread(json, 1, (size_t)file_size, f) != (size_t)file_size) {
+    char *buf = (char *)malloc((size_t)file_size + 1);
+    if (!buf || fread(buf, 1, (size_t)file_size, f) != (size_t)file_size) {
         fclose(f);
-        free(json);
+        free(buf);
         return NULL;
     }
     fclose(f);
-    json[file_size] = '\0';
+    buf[file_size] = '\0';
+    return buf;
+}
 
+/* Build a tokenizer from a {"token": id, ...} object. */
+static qwen_tokenizer_t *tokenizer_from_vocab(const char *obj) {
     int max_id = 0;
-    const char *p = json;
+    const char *p = obj;
     skip_ws(&p);
-    if (*p != '{') {
-        free(json);
-        return NULL;
-    }
+    if (*p != '{') return NULL;
     p++;
 
     const char *saved = p;
@@ -543,16 +640,12 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
 
     int vocab_size = max_id + 1;
     qwen_tokenizer_t *tok = (qwen_tokenizer_t *)calloc(1, sizeof(qwen_tokenizer_t));
-    if (!tok) {
-        free(json);
-        return NULL;
-    }
+    if (!tok) return NULL;
     tok->vocab_size = vocab_size;
     tok->id_to_text = (char **)calloc((size_t)vocab_size, sizeof(char *));
     tok->id_to_bpe = (char **)calloc((size_t)vocab_size, sizeof(char *));
     if (!tok->id_to_text || !tok->id_to_bpe) {
         qwen_tokenizer_free(tok);
-        free(json);
         return NULL;
     }
 
@@ -576,7 +669,6 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
             tok->id_to_text[id] = decode_gpt2_token(key);
         }
     }
-    free(json);
 
     int n_vocab_entries = 0;
     for (int i = 0; i < vocab_size; i++) if (tok->id_to_bpe[i]) n_vocab_entries++;
@@ -591,16 +683,76 @@ qwen_tokenizer_t *qwen_tokenizer_load(const char *vocab_json_path) {
             map_insert((str_int_entry_t *)tok->vocab_map, tok->vocab_map_cap, tok->id_to_bpe[i], i);
         }
     }
-
-    char merges_path[1024];
-    if (derive_merges_path(vocab_json_path, merges_path, sizeof(merges_path)) == 0) {
-        if (load_merges_map(tok, merges_path) != 0 && qwen_verbose >= 2) {
-            fprintf(stderr, "Tokenizer: merges not loaded from %s (encoding falls back to byte-level)\n",
-                    merges_path);
-        }
-    }
-
     return tok;
+}
+
+/* Original repos: vocab.json + merges.txt */
+static qwen_tokenizer_t *load_vocab_json(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/vocab.json", model_dir);
+    char *json = read_file(path);
+    if (!json) return NULL;
+    qwen_tokenizer_t *tok = tokenizer_from_vocab(json);
+    free(json);
+    if (!tok) return NULL;
+
+    snprintf(path, sizeof(path), "%s/merges.txt", model_dir);
+    if (load_merges_map(tok, path) != 0 && qwen_verbose >= 2) {
+        fprintf(stderr, "Tokenizer: merges not loaded from %s (encoding falls back to byte-level)\n",
+                path);
+    }
+    return tok;
+}
+
+/* -hf repos: tokenizer.json */
+static qwen_tokenizer_t *load_tokenizer_json(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/tokenizer.json", model_dir);
+    char *json = read_file(path);
+    if (!json) return NULL;
+
+    const char *model = json;
+    if (find_json_key(&model, "model") != 0) {
+        fprintf(stderr, "qwen_tokenizer_load: no \"model\" in %s\n", path);
+        free(json);
+        return NULL;
+    }
+    const char *vocab = model, *merges = model;
+    if (find_json_key(&vocab, "vocab") != 0) {
+        fprintf(stderr, "qwen_tokenizer_load: no \"model.vocab\" in %s\n", path);
+        free(json);
+        return NULL;
+    }
+    qwen_tokenizer_t *tok = tokenizer_from_vocab(vocab);
+    if (tok && (find_json_key(&merges, "merges") != 0 ||
+                load_merges_array(tok, merges) != 0) && qwen_verbose >= 2) {
+        fprintf(stderr, "Tokenizer: merges not loaded from %s (encoding falls back to byte-level)\n",
+                path);
+    }
+    free(json);
+    return tok;
+}
+
+/* ========================================================================
+ * Public API
+ * ======================================================================== */
+
+qwen_tokenizer_t *qwen_tokenizer_load(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/vocab.json", model_dir);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return load_vocab_json(model_dir);
+    }
+    snprintf(path, sizeof(path), "%s/tokenizer.json", model_dir);
+    f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return load_tokenizer_json(model_dir);
+    }
+    fprintf(stderr, "qwen_tokenizer_load: no vocab.json or tokenizer.json in %s\n", model_dir);
+    return NULL;
 }
 
 const char *qwen_tokenizer_decode(const qwen_tokenizer_t *tok, int token_id) {

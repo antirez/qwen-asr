@@ -25,8 +25,6 @@
  * Weight Loading
  * ======================================================================== */
 
-#define ENC_PREFIX "thinker.audio_tower."
-
 static float *load_f32(multi_safetensors_t *ms, const char *name) {
     safetensors_file_t *sf = NULL;
     const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
@@ -67,71 +65,74 @@ static float *load_bf16_as_f32(multi_safetensors_t *ms, const char *name) {
 int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
                        const qwen_config_t *cfg) {
     char name[512];
+    const char *pfx = cfg->hf_layout ? "model.audio_tower." : "thinker.audio_tower.";
+    const char *proj1 = cfg->hf_layout ? "model.multi_modal_projector.linear_1"
+                                       : "thinker.audio_tower.proj1";
+    const char *proj2 = cfg->hf_layout ? "model.multi_modal_projector.linear_2"
+                                       : "thinker.audio_tower.proj2";
 
     /* Conv2D stem (small, f32) */
-    snprintf(name, sizeof(name), "%sconv2d1.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d1.weight", pfx);
     enc->conv1_weight = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sconv2d1.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d1.bias", pfx);
     enc->conv1_bias = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sconv2d2.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d2.weight", pfx);
     enc->conv2_weight = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sconv2d2.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d2.bias", pfx);
     enc->conv2_bias = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sconv2d3.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d3.weight", pfx);
     enc->conv3_weight = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sconv2d3.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv2d3.bias", pfx);
     enc->conv3_bias = load_f32(ms, name);
 
     if (!enc->conv1_weight || !enc->conv2_weight || !enc->conv3_weight) return -1;
 
     /* Conv output projection (bf16, no bias) */
-    snprintf(name, sizeof(name), "%sconv_out.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sconv_out.weight", pfx);
     enc->conv_out_weight = load_bf16_as_f32(ms, name);
     if (!enc->conv_out_weight) return -1;
 
     /* Transformer layers */
     for (int i = 0; i < cfg->enc_layers; i++) {
         qwen_enc_layer_t *l = &enc->layers[i];
-        const char *lp = ENC_PREFIX "layers";
-
         /* Attention weights (bf16) and biases (f32) */
-        snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_proj.weight", pfx, i);
         l->wq_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.q_proj.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.q_proj.bias", pfx, i);
         l->wq_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_proj.weight", pfx, i);
         l->wk_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.k_proj.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.k_proj.bias", pfx, i);
         l->wk_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.v_proj.weight", pfx, i);
         l->wv_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.v_proj.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.v_proj.bias", pfx, i);
         l->wv_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.out_proj.weight", pfx, i);
         l->wo_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn.out_proj.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn.out_proj.bias", pfx, i);
         l->wo_bias = load_f32(ms, name);
 
         /* Pre-attention LayerNorm */
-        snprintf(name, sizeof(name), "%s.%d.self_attn_layer_norm.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn_layer_norm.weight", pfx, i);
         l->attn_norm_weight = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.self_attn_layer_norm.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.self_attn_layer_norm.bias", pfx, i);
         l->attn_norm_bias = load_f32(ms, name);
 
         /* FFN weights (bf16) and biases (f32) */
-        snprintf(name, sizeof(name), "%s.%d.fc1.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.fc1.weight", pfx, i);
         l->fc1_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.fc1.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.fc1.bias", pfx, i);
         l->fc1_bias = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.fc2.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.fc2.weight", pfx, i);
         l->fc2_weight = load_bf16_as_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.fc2.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.fc2.bias", pfx, i);
         l->fc2_bias = load_f32(ms, name);
 
         /* Pre-FFN LayerNorm */
-        snprintf(name, sizeof(name), "%s.%d.final_layer_norm.weight", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.final_layer_norm.weight", pfx, i);
         l->ffn_norm_weight = load_f32(ms, name);
-        snprintf(name, sizeof(name), "%s.%d.final_layer_norm.bias", lp, i);
+        snprintf(name, sizeof(name), "%slayers.%d.final_layer_norm.bias", pfx, i);
         l->ffn_norm_bias = load_f32(ms, name);
 
         if (!l->wq_weight || !l->wk_weight ||
@@ -143,19 +144,19 @@ int qwen_encoder_load(qwen_encoder_t *enc, multi_safetensors_t *ms,
     }
 
     /* Final LayerNorm */
-    snprintf(name, sizeof(name), "%sln_post.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sln_post.weight", pfx);
     enc->ln_post_weight = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sln_post.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%sln_post.bias", pfx);
     enc->ln_post_bias = load_f32(ms, name);
 
     /* Projection layers */
-    snprintf(name, sizeof(name), "%sproj1.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%s.weight", proj1);
     enc->proj1_weight = load_bf16_as_f32(ms, name);
-    snprintf(name, sizeof(name), "%sproj1.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%s.bias", proj1);
     enc->proj1_bias = load_f32(ms, name);
-    snprintf(name, sizeof(name), "%sproj2.weight", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%s.weight", proj2);
     enc->proj2_weight = load_bf16_as_f32(ms, name);
-    snprintf(name, sizeof(name), "%sproj2.bias", ENC_PREFIX);
+    snprintf(name, sizeof(name), "%s.bias", proj2);
     enc->proj2_bias = load_f32(ms, name);
 
     if (!enc->ln_post_weight || !enc->proj1_weight || !enc->proj2_weight)

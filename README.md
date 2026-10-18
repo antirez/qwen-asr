@@ -39,7 +39,7 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Almost zero dependencies**: The CPU implementation only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
 - **NVIDIA GPU acceleration**: Native CUDA kernels, cuBLAS, Q8 decoding, and CUDA graphs. Tested on DGX Spark (GB10, `sm_121`).
 - **AMD GPU acceleration**: Optional ROCm backend with HIP kernels, rocBLAS, Q8 decoding, and HIP graphs. Tested on Strix Halo (Radeon 8060S, `gfx1151`).
-- **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
+- **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files. Both the original repos and the transformers-native `-hf` repos (`Qwen/Qwen3-ASR-0.6B-hf`, `Qwen/Qwen3-ASR-1.7B-hf`) load as-is.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
 - **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
 - **Monitor mode**: `--monitor` shows inline Unicode symbols on stderr for real-time pipeline diagnostics.

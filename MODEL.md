@@ -329,6 +329,20 @@ mlp.down_proj.weight                [hidden_size, intermediate]
 ```
 Plus `thinker.model.norm.weight [hidden_size]` (final norm). NO biases in decoder.
 
+**Transformers-native repos** (`Qwen/Qwen3-ASR-{0.6B,1.7B}-hf`): same tensors,
+shapes and dtypes, only renamed. The tokenizer ships as `tokenizer.json` (same
+vocab and merges) instead of `vocab.json` + `merges.txt`.
+
+| Original | `-hf` |
+|---|---|
+| `thinker.audio_tower.*` | `model.audio_tower.*` |
+| `thinker.audio_tower.proj1.*` | `model.multi_modal_projector.linear_1.*` |
+| `thinker.audio_tower.proj2.*` | `model.multi_modal_projector.linear_2.*` |
+| `thinker.model.*` | `model.language_model.*` |
+| `thinker.lm_head.weight` | (absent, tied to `embed_tokens`) |
+
+Both layouts are detected automatically at load time.
+
 ---
 
 ## Decode Schedule

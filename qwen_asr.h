@@ -66,6 +66,7 @@ typedef struct {
     int vocab_size;            /* 151936 */
     float dec_rms_norm_eps;    /* 1e-6 */
     float dec_rope_theta;      /* 1e6 */
+    int hf_layout;             /* 1 = -hf repo naming (model.* instead of thinker.*) */
 } qwen_config_t;
 
 /* ========================================================================
