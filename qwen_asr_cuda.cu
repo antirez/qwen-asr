@@ -79,14 +79,18 @@ struct GPU {
     }
     float *vector(const float *x,int n) {
         if(!x) throw std::runtime_error("missing weight vector");
-        float *p=alloc<float>(n); CUDA(cudaMemcpy(p,x,n*4,cudaMemcpyHostToDevice));return p;
+        // Copy on the work stream and wait: a pageable cudaMemcpy may return before the DMA lands,
+        // and the non-blocking stream does not order against the legacy default stream.
+        float *p=alloc<float>(n); CUDA(cudaMemcpyAsync(p,x,n*4,cudaMemcpyHostToDevice,stream));
+        CUDA(cudaStreamSynchronize(stream));return p;
     }
     Matrix matrix(const void *x,int in,int out,bool bf16,bool quant=false) {
         if(!x) throw std::runtime_error("missing weight matrix");
         Matrix m; m.in=in;m.out=out;size_t n=(size_t)in*out;
         m.w=alloc<half>(n);
         Buffer tmp;tmp.reserve(n*(bf16?2:4));
-        CUDA(cudaMemcpy(tmp.ptr,x,tmp.bytes,cudaMemcpyHostToDevice));
+        // Same stream as the conversion kernel below, so it cannot read a partly copied buffer.
+        CUDA(cudaMemcpyAsync(tmp.ptr,x,tmp.bytes,cudaMemcpyHostToDevice,stream));
         if(bf16) bf16_to_half<<<blocks(n),256,0,stream>>>(m.w,tmp.as<uint16_t>(),n);
         else to_half<<<blocks(n),256,0,stream>>>(m.w,tmp.as(),n);
         if(quant && q8) {
