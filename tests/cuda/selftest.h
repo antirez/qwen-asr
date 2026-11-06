@@ -13,7 +13,9 @@ static void check_array(const char *name,const float *actual,const std::vector<f
 static std::vector<float> download(GPU &g,Buffer &b,size_t n) {
     std::vector<float>x(n);CUDA(cudaMemcpyAsync(x.data(),b.ptr,n*4,cudaMemcpyDeviceToHost,g.stream));CUDA(cudaStreamSynchronize(g.stream));return x;
 }
-static void upload(Buffer &b,const std::vector<float>&v) {b.reserve(v.size()*4);CUDA(cudaMemcpy(b.ptr,v.data(),v.size()*4,cudaMemcpyHostToDevice));}
+// cudaDeviceSynchronize: a pageable cudaMemcpy may return before the DMA lands, and the
+// kernels under test run on a non-blocking stream that does not order against it.
+static void upload(Buffer &b,const std::vector<float>&v) {b.reserve(v.size()*4);CUDA(cudaMemcpy(b.ptr,v.data(),v.size()*4,cudaMemcpyHostToDevice));CUDA(cudaDeviceSynchronize());}
 static float value(size_t i) {return sinf((float)i*.137f)*.7f+cosf((float)i*.023f)*.2f;}
 static int run_selftests() {
     (void)device_properties();
@@ -56,7 +58,7 @@ static int run_selftests() {
         std::vector<float>q(n*qh*hd),k(kn*kh*hd),v(k.size()),ref(q.size());
         for(size_t i=0;i<q.size();i++)q[i]=value(i+5);
         for(size_t i=0;i<k.size();i++){k[i]=value(i+77);v[i]=value(i+301);}
-        Buffer dq,dk,dv,dy,dp;upload(dq,q);upload(dk,k);upload(dv,v);dy.reserve(q.size()*4);dp.reserve(4);CUDA(cudaMemcpy(dp.ptr,&pos,4,cudaMemcpyHostToDevice));
+        Buffer dq,dk,dv,dy,dp;upload(dq,q);upload(dk,k);upload(dv,v);dy.reserve(q.size()*4);dp.reserve(4);CUDA(cudaMemcpy(dp.ptr,&pos,4,cudaMemcpyHostToDevice));CUDA(cudaDeviceSynchronize());
         if(causal)attention<128,true><<<dim3(n,qh),128,0,g.stream>>>(dy.as(),dq.as(),dk.as(),dv.as(),qh,kh,n,104,dp.as<int>());
         else attention<64,false><<<dim3(n,qh),128,0,g.stream>>>(dy.as(),dq.as(),dk.as(),dv.as(),qh,kh,n,104,nullptr);
         for(int t=0;t<n;t++)for(int h=0;h<qh;h++) {
@@ -73,7 +75,7 @@ static int run_selftests() {
         std::vector<float>x(n*stride),qw(hd),kw(hd),rq(n*qd),rk((pos+n)*kd,0),rv(rk.size(),0);
         for(size_t i=0;i<x.size();i++)x[i]=value(i);
         for(int d=0;d<hd;d++){qw[d]=value(d)+1;kw[d]=value(d+32)+1;}
-        Buffer dx,dq,dk,dv,dp;upload(dx,x);dq.reserve(rq.size()*4);upload(dk,rk);upload(dv,rv);dp.reserve(4);CUDA(cudaMemcpy(dp.ptr,&pos,4,cudaMemcpyHostToDevice));
+        Buffer dx,dq,dk,dv,dp;upload(dx,x);dq.reserve(rq.size()*4);upload(dk,rk);upload(dv,rv);dp.reserve(4);CUDA(cudaMemcpy(dp.ptr,&pos,4,cudaMemcpyHostToDevice));CUDA(cudaDeviceSynchronize());
         qk_rope_cache<<<dim3(n,qh+kh),128,0,g.stream>>>(dq.as(),dk.as(),dv.as(),dx.as(),g.vector(qw.data(),hd),g.vector(kw.data(),hd),qh,kh,hd,dp.as<int>(),1e-6f,1e6f);
         for(int t=0;t<n;t++)for(int h=0;h<qh+kh;h++) {
             bool isq=h<qh;int head=isq?h:h-qh,off=t*stride+(isq?0:qd)+head*hd;
